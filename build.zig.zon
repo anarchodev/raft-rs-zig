@@ -1,0 +1,22 @@
+.{
+    .name = .raft_rs_zig,
+    .version = "0.0.1",
+    .fingerprint = 0x746b2b385f181848,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    // raft-sys/target/ is deliberately excluded — that's cargo's
+    // build dir and would explode the package size if vendored.
+    // Consumers running `zig build` invoke `cargo build` themselves
+    // via build.zig's cargo step.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "raft-sys/Cargo.toml",
+        "raft-sys/Cargo.lock",
+        "raft-sys/build.rs",
+        "raft-sys/cbindgen.toml",
+        "raft-sys/src",
+        "raft-sys/include",
+    },
+}

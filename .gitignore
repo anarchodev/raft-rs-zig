@@ -1,0 +1,5 @@
+/zig-out/
+/.zig-cache/
+/raft-sys/target/
+/raft-sys/include/
+/raft-sys/Cargo.lock

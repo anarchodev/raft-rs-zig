@@ -1,0 +1,23 @@
+[package]
+name = "raft-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "raft_sys"
+crate-type = ["staticlib"]
+
+[dependencies]
+raft = "0.7"
+slog = "2"
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
