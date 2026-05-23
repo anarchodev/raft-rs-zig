@@ -69,6 +69,7 @@ pub const Error = error{
     TakeMessagesFailed,
     StepFailed,
     StepDecodeFailed,
+    UnknownGroup,
 };
 
 /// One `raft-rs` MultiRaft manager. Owns all the groups beneath
@@ -157,6 +158,16 @@ pub const Manager = struct {
     /// replication timeouts fire on schedule.
     pub fn tickAll(self: *Manager) void {
         _ = c.raft_manager_tick_all(self.ptr);
+    }
+
+    /// Tick exactly one group. Used by callers that implement
+    /// hibernation policy at their layer (raft-rs doesn't have a
+    /// hibernate concept; TiKV's raftstore is the design template).
+    /// Skipping a hibernated group's tick lets the per-cycle cost
+    /// scale with the active-group count, not total-group count.
+    /// `error.UnknownGroup` if `group_id` isn't registered.
+    pub fn tick(self: *Manager, group_id: u64) Error!void {
+        if (c.raft_manager_tick(self.ptr, group_id) != 0) return Error.UnknownGroup;
     }
 
     /// Identify groups with pending applies. Returns a slice into
