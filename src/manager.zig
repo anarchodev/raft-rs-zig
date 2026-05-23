@@ -19,15 +19,20 @@ const c = @cImport({
 });
 const storage_mod = @import("storage.zig");
 const file_storage_mod = @import("file_storage.zig");
+const grouped_file_storage_mod = @import("grouped_file_storage.zig");
 
 pub const MemStorage = storage_mod.MemStorage;
 pub const FileStorage = file_storage_mod.FileStorage;
+pub const SharedWal = grouped_file_storage_mod.SharedWal;
+pub const GroupedFileStorage = grouped_file_storage_mod.GroupedFileStorage;
 /// Re-export of the C-ABI storage vtable type so consumers can
 /// pass it around (as `*const StorageVTable`) without their own
 /// `@cImport` of `raft_sys.h`.
 pub const StorageVTable = c.RaftStorageVTable;
 pub const storage_vtable: *const c.RaftStorageVTable = @ptrCast(&storage_mod.vtable);
 pub const file_storage_vtable: *const c.RaftStorageVTable = @ptrCast(&file_storage_mod.vtable);
+pub const grouped_file_storage_vtable: *const c.RaftStorageVTable =
+    @ptrCast(&grouped_file_storage_mod.vtable);
 
 /// Raw C-ABI apply callback signature. Re-exported so consumers
 /// don't have to repeat the calling-convention boilerplate.
