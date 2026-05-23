@@ -692,6 +692,41 @@ pub unsafe extern "C" fn raft_manager_tick_all(m: *mut RaftManager) -> usize {
     mgr.groups.len()
 }
 
+/// Batched per-group tick — caller supplies the set of group ids to
+/// tick (typically the "active" set their hibernation policy
+/// tracks). Returns the count of ids that resolved to live groups.
+/// Single FFI call regardless of count, so the per-tenant FFI
+/// overhead doesn't dominate when the active set is large.
+///
+/// Unknown ids are skipped silently (count excludes them) — lets
+/// the caller pass a slightly stale active set without churn.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_tick_groups(
+    m: *mut RaftManager,
+    group_ids: *const u64,
+    count: usize,
+) -> usize {
+    if m.is_null() {
+        return 0;
+    }
+    if count == 0 {
+        return 0; // `from_raw_parts` rejects len=0 + possibly-null ptr.
+    }
+    if group_ids.is_null() {
+        return 0;
+    }
+    let mgr = &mut *m;
+    let ids = std::slice::from_raw_parts(group_ids, count);
+    let mut ticked = 0;
+    for &gid in ids {
+        if let Some(slot) = mgr.groups.get_mut(&gid) {
+            slot.node.tick();
+            ticked += 1;
+        }
+    }
+    ticked
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_poll_ready(
     m: *const RaftManager,

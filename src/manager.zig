@@ -170,6 +170,15 @@ pub const Manager = struct {
         if (c.raft_manager_tick(self.ptr, group_id) != 0) return Error.UnknownGroup;
     }
 
+    /// Batched per-group tick. Ticks every group id in `group_ids`
+    /// that's currently live; skips unknown ids silently. One FFI
+    /// call regardless of length, so the per-tenant overhead the
+    /// single `tick` shape has at large active sets is eliminated.
+    /// Returns the number of groups actually ticked.
+    pub fn tickGroups(self: *Manager, group_ids: []const u64) usize {
+        return c.raft_manager_tick_groups(self.ptr, group_ids.ptr, group_ids.len);
+    }
+
     /// Identify groups with pending applies. Returns a slice into
     /// the caller's buffer; the buffer must be sized to fit at
     /// least as many group IDs as the manager has groups (use
