@@ -62,6 +62,7 @@ pub const Error = error{
     ManagerInitFailed,
     CreateGroupFailed,
     DestroyGroupFailed,
+    ClearTombstoneFailed,
     CampaignFailed,
     ProposeFailed,
     ProcessReadyFailed,
@@ -114,9 +115,23 @@ pub const Manager = struct {
 
     /// Tear down the group. Storage is freed via the `destroy`
     /// vtable callback; any outstanding pointers into it are
-    /// dangling after this call.
+    /// dangling after this call. The group's id enters a tombstone
+    /// set so a later `createGroup` with the same id will fail —
+    /// preventing accidental id reuse. Migration-style attach (an
+    /// intentional reuse after detach) must call `clearTombstone`
+    /// before `createGroup`.
     pub fn destroyGroup(self: *Manager, group_id: u64) Error!void {
         if (c.raft_manager_destroy_group(self.ptr, group_id) != 0) return Error.DestroyGroupFailed;
+    }
+
+    /// Lift the tombstone for `group_id`, so a subsequent
+    /// `createGroup` with that id can succeed. The intended caller
+    /// is `attachGroup` (Stage 3d migration) reusing a tenant id
+    /// that was previously destroyed via `detachGroup`. A no-op on
+    /// a non-tombstoned id.
+    pub fn clearTombstone(self: *Manager, group_id: u64) Error!void {
+        if (c.raft_manager_clear_tombstone(self.ptr, group_id) != 0)
+            return Error.ClearTombstoneFailed;
     }
 
     /// Force this node to become leader of `group_id`. Useful for

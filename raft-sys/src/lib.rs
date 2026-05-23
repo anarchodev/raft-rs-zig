@@ -436,6 +436,30 @@ pub unsafe extern "C" fn raft_manager_is_tombstoned(
     mgr.tombstones.contains(&group_id)
 }
 
+/// Lift the tombstone for `group_id`, allowing a subsequent
+/// `create_group` with that id to succeed. This is the migration
+/// primitive's escape hatch: a tenant detached on one node (which
+/// adds its id to the local tombstone set) and attached again
+/// later (perhaps after a round-trip through `Bundle` serialization
+/// to a different node) MUST be able to re-create the group. The
+/// tombstone-prevents-reuse safety check is intended for accidental
+/// id collisions; intentional reuse calls this first.
+///
+/// Returns 0 unconditionally — calling on a non-tombstoned id is
+/// a no-op, not an error.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_clear_tombstone(
+    m: *mut RaftManager,
+    group_id: u64,
+) -> i32 {
+    if m.is_null() {
+        return -3;
+    }
+    let mgr = &mut *m;
+    mgr.tombstones.remove(&group_id);
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_group_count(m: *const RaftManager) -> usize {
     let mgr = &*m;
