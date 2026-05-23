@@ -27,11 +27,14 @@
 
 pub const manager = @import("manager.zig");
 pub const storage = @import("storage.zig");
+pub const file_storage = @import("file_storage.zig");
 
 // ── flattened public API ──────────────────────────────────────────────
 
 pub const Manager = manager.Manager;
 pub const MemStorage = manager.MemStorage;
+pub const FileStorage = file_storage.FileStorage;
+pub const StorageVTable = manager.StorageVTable;
 pub const ApplyCb = manager.ApplyCb;
 pub const Error = manager.Error;
 

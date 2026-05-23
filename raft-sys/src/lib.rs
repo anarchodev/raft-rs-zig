@@ -3,6 +3,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 
+use protobuf::Message as PbMessage;
 use raft::eraftpb::{ConfState, HardState, Snapshot, SnapshotMetadata};
 use raft::prelude::*;
 use raft::storage::Storage;
@@ -305,13 +306,40 @@ pub type RaftApplyCb = unsafe extern "C" fn(
     len: usize,
 );
 
+/// Message callback (Rust → caller, per outbound raft message).
+/// Invoked from `raft_manager_take_messages` for each message that
+/// `processReady` buffered into the group's outbox. `to` is the
+/// raft node id of the intended recipient (encoded inside
+/// `msg_bytes` too, but exposed here so the caller can route
+/// without parsing the protobuf). `msg_bytes`/`msg_len` is the
+/// rust-protobuf serialization of a `raft::eraftpb::Message` and
+/// is valid only for the duration of the callback.
+pub type RaftMessageCb = unsafe extern "C" fn(
+    userdata: *mut c_void,
+    to: u64,
+    msg_bytes: *const u8,
+    msg_len: usize,
+);
+
 // ─── Manager ─────────────────────────────────────────────────────────────────
+
+/// Per-group state held by the manager: the raw raft node plus a
+/// caller-drained outbox of outbound messages produced by the
+/// most recent `processReady` cycles.
+struct GroupSlot {
+    node: RawNode<FfiStorage>,
+    /// (to, serialized message bytes). Drained by
+    /// `raft_manager_take_messages`. v1 multi-node transport
+    /// queries this between every `processReady` to ferry
+    /// messages to peer nodes.
+    outbox: Vec<(u64, Vec<u8>)>,
+}
 
 /// Multi-raft manager. Caller-serialized.
 ///
 /// cbindgen:opaque
 pub struct RaftManager {
-    groups: HashMap<u64, RawNode<FfiStorage>>,
+    groups: HashMap<u64, GroupSlot>,
     tombstones: HashSet<u64>,
     logger: Logger,
 }
@@ -366,7 +394,13 @@ pub unsafe extern "C" fn raft_manager_create_group(
     };
     match RawNode::new(&cfg, storage, &mgr.logger) {
         Ok(node) => {
-            mgr.groups.insert(group_id, node);
+            mgr.groups.insert(
+                group_id,
+                GroupSlot {
+                    node,
+                    outbox: Vec::new(),
+                },
+            );
             0
         }
         Err(_) => -3,
@@ -412,8 +446,8 @@ pub unsafe extern "C" fn raft_manager_group_count(m: *const RaftManager) -> usiz
 pub unsafe extern "C" fn raft_manager_tick(m: *mut RaftManager, group_id: u64) -> i32 {
     let mgr = &mut *m;
     match mgr.groups.get_mut(&group_id) {
-        Some(node) => {
-            node.tick();
+        Some(slot) => {
+            slot.node.tick();
             0
         }
         None => -1,
@@ -424,7 +458,7 @@ pub unsafe extern "C" fn raft_manager_tick(m: *mut RaftManager, group_id: u64) -
 pub unsafe extern "C" fn raft_manager_campaign(m: *mut RaftManager, group_id: u64) -> i32 {
     let mgr = &mut *m;
     match mgr.groups.get_mut(&group_id) {
-        Some(node) => match node.campaign() {
+        Some(slot) => match slot.node.campaign() {
             Ok(()) => 0,
             Err(_) => -2,
         },
@@ -440,8 +474,8 @@ pub unsafe extern "C" fn raft_manager_propose(
     len: usize,
 ) -> i32 {
     let mgr = &mut *m;
-    let node = match mgr.groups.get_mut(&group_id) {
-        Some(n) => n,
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
         None => return -1,
     };
     let bytes = if len == 0 {
@@ -449,10 +483,66 @@ pub unsafe extern "C" fn raft_manager_propose(
     } else {
         slice::from_raw_parts(data, len).to_vec()
     };
-    match node.propose(vec![], bytes) {
+    match slot.node.propose(vec![], bytes) {
         Ok(()) => 0,
         Err(_) => -2,
     }
+}
+
+/// Deliver an inbound raft message from a peer. `msg_bytes` is the
+/// rust-protobuf serialization of a `raft::eraftpb::Message`
+/// (typically produced by the peer's `raft_manager_take_messages`
+/// callback). Returns 0 on success, -1 if the group is unknown,
+/// -2 if the message fails to deserialize, -3 if `step` rejects it.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_step(
+    m: *mut RaftManager,
+    group_id: u64,
+    msg_bytes: *const u8,
+    msg_len: usize,
+) -> i32 {
+    if msg_bytes.is_null() {
+        return -2;
+    }
+    let mgr = &mut *m;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let bytes = slice::from_raw_parts(msg_bytes, msg_len);
+    let msg = match Message::parse_from_bytes(bytes) {
+        Ok(m) => m,
+        Err(_) => return -2,
+    };
+    match slot.node.step(msg) {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
+/// Drain the group's outbox of outbound raft messages. `cb` fires
+/// once per message in FIFO order; the message bytes are valid only
+/// for the duration of the callback (Rust frees them after).
+/// Returns 0 on success, -1 if the group is unknown.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_take_messages(
+    m: *mut RaftManager,
+    group_id: u64,
+    cb: RaftMessageCb,
+    userdata: *mut c_void,
+) -> i32 {
+    let mgr = &mut *m;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    // drain(..) yields ownership of each (to, Vec<u8>); the Vec
+    // is dropped after the callback returns, so the pointer
+    // handed out has lifetime = callback scope only.
+    for (to, bytes) in slot.outbox.drain(..) {
+        cb(userdata, to, bytes.as_ptr(), bytes.len());
+    }
+    0
 }
 
 #[no_mangle]
@@ -460,7 +550,7 @@ pub unsafe extern "C" fn raft_manager_is_leader(m: *const RaftManager, group_id:
     let mgr = &*m;
     mgr.groups
         .get(&group_id)
-        .map(|n| n.raft.state == StateRole::Leader)
+        .map(|s| s.node.raft.state == StateRole::Leader)
         .unwrap_or(false)
 }
 
@@ -472,22 +562,22 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     userdata: *mut c_void,
 ) -> i32 {
     let mgr = &mut *m;
-    let node = match mgr.groups.get_mut(&group_id) {
-        Some(n) => n,
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
         None => return -1,
     };
-    if !node.has_ready() {
+    if !slot.node.has_ready() {
         return 0;
     }
 
     // Capture stable pointers to the storage vtable + userdata before the
     // mutable borrow that `node.ready()` will impose.
     let (vtable_ptr, store_userdata) = {
-        let s = node.store();
+        let s = slot.node.store();
         (&s.vtable as *const RaftStorageVTable, s.userdata)
     };
 
-    let mut ready = node.ready();
+    let mut ready = slot.node.ready();
 
     // Persist hard state.
     if let Some(hs) = ready.hs() {
@@ -530,25 +620,50 @@ pub unsafe extern "C" fn raft_manager_process_ready(
         }
     }
 
-    // Single-node: drop messages.
-    let _ = ready.take_messages();
-    let _ = ready.take_persisted_messages();
+    // Drain outbound messages into local vecs first — pushing
+    // them to slot.outbox here would conflict with the live
+    // borrow `ready` holds on slot.node. We park them, drop
+    // `ready`, then push.
+    let ready_msgs = ready.take_messages();
+    let persisted_msgs = ready.take_persisted_messages();
 
     apply_committed(group_id, ready.take_committed_entries(), cb, userdata);
 
-    let mut light_rd = node.advance(ready);
-    let _ = light_rd.take_messages();
+    let mut light_rd = slot.node.advance(ready);
+    let light_msgs = light_rd.take_messages();
     apply_committed(group_id, light_rd.take_committed_entries(), cb, userdata);
 
-    node.advance_apply();
+    slot.node.advance_apply();
+
+    // Serialize the parked messages and push to the outbox. The
+    // caller drains it via `raft_manager_take_messages` and
+    // routes each to its `to` recipient.
+    push_messages(&mut slot.outbox, ready_msgs);
+    push_messages(&mut slot.outbox, persisted_msgs);
+    push_messages(&mut slot.outbox, light_msgs);
+
     0
+}
+
+/// Serialize each `Message` via rust-protobuf and push into the
+/// outbox keyed by recipient. Failed serializations are dropped
+/// (logged in the future; currently silent — these should never
+/// happen for well-formed raft messages).
+fn push_messages(outbox: &mut Vec<(u64, Vec<u8>)>, msgs: Vec<Message>) {
+    for msg in msgs {
+        let to = msg.to;
+        match msg.write_to_bytes() {
+            Ok(bytes) => outbox.push((to, bytes)),
+            Err(_) => { /* unreachable for valid messages */ }
+        }
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_tick_all(m: *mut RaftManager) -> usize {
     let mgr = &mut *m;
-    for node in mgr.groups.values_mut() {
-        node.tick();
+    for slot in mgr.groups.values_mut() {
+        slot.node.tick();
     }
     mgr.groups.len()
 }
@@ -564,11 +679,17 @@ pub unsafe extern "C" fn raft_manager_poll_ready(
     }
     let mgr = &*m;
     let mut count = 0usize;
-    for (gid, node) in mgr.groups.iter() {
+    for (gid, slot) in mgr.groups.iter() {
         if count >= cap {
             break;
         }
-        if node.has_ready() {
+        // A group is "ready to drain" if raft thinks so OR if the
+        // outbox still has buffered outbound messages from a
+        // previous processReady that the caller hasn't fetched yet.
+        // The latter case is important for multi-node: the caller
+        // may want to schedule the take_messages cycle separately
+        // from has_ready.
+        if slot.node.has_ready() || !slot.outbox.is_empty() {
             ptr::write(out_buf.add(count), *gid);
             count += 1;
         }

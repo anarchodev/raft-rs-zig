@@ -43,7 +43,7 @@ pub fn main() !void {
 
     for (groups) |gid| {
         const st = try raft.MemStorage.init(allocator, &.{1});
-        try mgr.createGroup(gid, 1, st);
+        try mgr.createGroup(gid, 1, raft.manager.storage_vtable, st);
         try mgr.campaign(gid);
     }
 

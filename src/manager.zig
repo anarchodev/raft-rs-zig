@@ -18,9 +18,16 @@ const c = @cImport({
     @cInclude("raft_sys.h");
 });
 const storage_mod = @import("storage.zig");
+const file_storage_mod = @import("file_storage.zig");
 
 pub const MemStorage = storage_mod.MemStorage;
-pub const storage_vtable = &storage_mod.vtable;
+pub const FileStorage = file_storage_mod.FileStorage;
+/// Re-export of the C-ABI storage vtable type so consumers can
+/// pass it around (as `*const StorageVTable`) without their own
+/// `@cImport` of `raft_sys.h`.
+pub const StorageVTable = c.RaftStorageVTable;
+pub const storage_vtable: *const c.RaftStorageVTable = @ptrCast(&storage_mod.vtable);
+pub const file_storage_vtable: *const c.RaftStorageVTable = @ptrCast(&file_storage_mod.vtable);
 
 /// Raw C-ABI apply callback signature. Re-exported so consumers
 /// don't have to repeat the calling-convention boilerplate.
@@ -33,6 +40,19 @@ pub const ApplyCb = *const fn (
     len: usize,
 ) callconv(.c) void;
 
+/// Raw C-ABI outbound-message callback signature. Fires once per
+/// message queued during `processReady`, when the caller drives
+/// `takeMessages`. `to` is the destination raft node id;
+/// `msg_bytes` is the rust-protobuf serialization of the
+/// `eraftpb::Message` and is valid only for the duration of the
+/// callback. The caller hands `msg_bytes` to the peer's `step`.
+pub const MessageCb = *const fn (
+    userdata: ?*anyopaque,
+    to: u64,
+    msg_bytes: [*c]const u8,
+    msg_len: usize,
+) callconv(.c) void;
+
 pub const Error = error{
     ManagerInitFailed,
     CreateGroupFailed,
@@ -40,6 +60,9 @@ pub const Error = error{
     CampaignFailed,
     ProposeFailed,
     ProcessReadyFailed,
+    TakeMessagesFailed,
+    StepFailed,
+    StepDecodeFailed,
 };
 
 /// One `raft-rs` MultiRaft manager. Owns all the groups beneath
@@ -63,12 +86,24 @@ pub const Manager = struct {
     /// `storage` pointer is held by raft-rs via the vtable's
     /// userdata slot; the storage is freed when the group is
     /// destroyed (via the `destroy` vtable callback).
-    pub fn createGroup(self: *Manager, group_id: u64, node_id: u64, storage: *MemStorage) Error!void {
-        _ = node_id; // currently unused by the FFI shape — encoded via storage.voters
-        // `@ptrCast` bridges the per-file @cImport types: storage_vtable's
-        // type is from storage.zig's @cImport scope; the C fn expects the
-        // identically-shaped type from manager.zig's @cImport scope.
-        const rc = c.raft_manager_create_group(self.ptr, group_id, 1, @ptrCast(storage_vtable), storage);
+    ///
+    /// `vtable` selects the storage implementation. Pass
+    /// `storage_vtable` for the in-memory MemStorage (most callers)
+    /// or `file_storage.vtable` for the WAL-backed FileStorage. Any
+    /// vtable whose userdata layout matches the pointer passed in
+    /// `storage_userdata` works — the C ABI here is opaque.
+    pub fn createGroup(
+        self: *Manager,
+        group_id: u64,
+        node_id: u64,
+        vtable: *const c.RaftStorageVTable,
+        storage_userdata: *anyopaque,
+    ) Error!void {
+        // `node_id` is this node's identity within the group's
+        // voter set — must match one of the `voters` the storage
+        // returns from `initial_state`. Single-node tests/demos
+        // always pass 1; multi-node uses 1..=cluster_size.
+        const rc = c.raft_manager_create_group(self.ptr, group_id, node_id, vtable, storage_userdata);
         if (rc != 0) return Error.CreateGroupFailed;
     }
 
@@ -128,4 +163,126 @@ pub const Manager = struct {
     pub fn groupCount(self: *const Manager) usize {
         return c.raft_manager_group_count(self.ptr);
     }
+
+    /// Drain the group's outbox of outbound raft messages. `cb`
+    /// fires once per message in FIFO order; the bytes handed to
+    /// the callback live only until the callback returns (Rust
+    /// frees them after). The typical pattern: in the callback,
+    /// route `(to, bytes)` into a network sim or transport layer,
+    /// which will eventually deliver them to the recipient's
+    /// `step`.
+    pub fn takeMessages(
+        self: *Manager,
+        group_id: u64,
+        cb: MessageCb,
+        userdata: ?*anyopaque,
+    ) Error!void {
+        if (c.raft_manager_take_messages(self.ptr, group_id, cb, userdata) != 0)
+            return Error.TakeMessagesFailed;
+    }
+
+    /// Deliver an inbound raft message produced by a peer's
+    /// `takeMessages`. `msg_bytes` is the protobuf-serialized
+    /// `eraftpb::Message` — opaque to Zig; raft-rs deserializes
+    /// on the Rust side.
+    pub fn step(self: *Manager, group_id: u64, msg_bytes: []const u8) Error!void {
+        const rc = c.raft_manager_step(self.ptr, group_id, msg_bytes.ptr, msg_bytes.len);
+        return switch (rc) {
+            0 => {},
+            -2 => Error.StepDecodeFailed,
+            else => Error.StepFailed,
+        };
+    }
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+const MsgCollector = struct {
+    var bytes_buf: [4096]u8 = undefined;
+    var bytes_len: usize = 0;
+    var last_to: u64 = 0;
+    var count: usize = 0;
+
+    fn reset() void {
+        bytes_len = 0;
+        last_to = 0;
+        count = 0;
+    }
+
+    fn cb(
+        ud: ?*anyopaque,
+        to: u64,
+        msg_bytes: [*c]const u8,
+        msg_len: usize,
+    ) callconv(.c) void {
+        _ = ud;
+        last_to = to;
+        count += 1;
+        const n = @min(msg_len, bytes_buf.len);
+        @memcpy(bytes_buf[0..n], msg_bytes[0..n]);
+        bytes_len = n;
+    }
+
+    fn snapshot() []const u8 {
+        return bytes_buf[0..bytes_len];
+    }
+};
+
+test "Manager: take_messages drains the outbox after a campaign (multi-node sanity)" {
+    // Two nodes (groups 1 and 2 internally, but they're really two
+    // logical raft nodes with peer ids 1, 2). Node 1 thinks the
+    // cluster is {1, 2}; node 2 thinks the same. Node 1 campaigns;
+    // raft-rs queues a RequestVote message destined for node 2.
+    // We drain it and assert.
+
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+
+    const storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
+    try mgr.createGroup(1, 1, storage_vtable, storage);
+    try mgr.campaign(1);
+
+    // The campaign synchronously stages a RequestVote message;
+    // processReady extracts it into the outbox. One tick + one
+    // ready pump is enough for the message to materialize.
+    var buf: [16]u64 = undefined;
+    mgr.tickAll();
+    const ready = mgr.pollReady(&buf);
+    try testing.expect(ready.len >= 1);
+    for (ready) |g| try mgr.processReady(g, struct {
+        fn cb(
+            ud: ?*anyopaque,
+            gid: u64,
+            idx: u64,
+            term: u64,
+            data: [*c]const u8,
+            len: usize,
+        ) callconv(.c) void {
+            _ = ud;
+            _ = gid;
+            _ = idx;
+            _ = term;
+            _ = data;
+            _ = len;
+        }
+    }.cb, null);
+
+    MsgCollector.reset();
+    try mgr.takeMessages(1, MsgCollector.cb, null);
+    // RequestVote goes to node 2.
+    try testing.expectEqual(@as(u64, 2), MsgCollector.last_to);
+    try testing.expect(MsgCollector.count >= 1);
+    try testing.expect(MsgCollector.snapshot().len > 0);
+}
+
+test "Manager: step rejects garbage bytes with StepDecodeFailed" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroup(1, 1, storage_vtable, storage);
+
+    const garbage = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(Error.StepDecodeFailed, mgr.step(1, &garbage));
+}

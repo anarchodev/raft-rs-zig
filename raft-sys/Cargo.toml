@@ -11,6 +11,10 @@ crate-type = ["staticlib"]
 [dependencies]
 raft = "0.7"
 slog = "2"
+# raft 0.7 generates its protobuf types via rust-protobuf v2; bring
+# the trait into scope so we can serialize/deserialize Messages at
+# the FFI boundary.
+protobuf = "2"
 
 [build-dependencies]
 cbindgen = "0.27"
