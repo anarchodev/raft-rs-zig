@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 
 use protobuf::Message as PbMessage;
 use raft::eraftpb::{ConfState, HardState, Snapshot, SnapshotMetadata};
@@ -323,6 +325,45 @@ pub type RaftMessageCb = unsafe extern "C" fn(
 
 // ─── Manager ─────────────────────────────────────────────────────────────────
 
+// ── Mailbox / ready-channel state machine ─────────────────────────────
+//
+// raft-rs is purely the consensus state machine; it has no concept of
+// "this group has new work". Without help, callers must iterate every
+// registered group on every pump cycle to find the few that do — which
+// turned into a hard ceiling at K = thousands of mostly-idle groups
+// (rewind2's K=10k zipf bench was bound by O(K) `poll_ready` scans).
+//
+// The fix, modeled on TiKV's batch-system, is a per-slot "notification"
+// state plus a manager-level FIFO of groups known to have work:
+//
+//   * Every op that produces work (`propose`, `step`, `campaign`,
+//     `tick`-that-fires-something) calls `notify_locked(slot,
+//     group_id)`. The helper CAS-flips `slot.state` from IDLE to
+//     NOTIFIED and on success pushes `group_id` onto the manager's
+//     `pending` queue.
+//
+//   * `raft_manager_poll_ready` drains `pending` instead of iterating
+//     `groups`. Cost is O(returned-count), independent of total K.
+//
+//   * After processing a group (process_ready + take_messages), the
+//     caller must call `raft_manager_release(group_id)` so the slot
+//     can transition NOTIFIED → IDLE. Release also checks whether new
+//     work landed during the round (raft state advanced or outbox
+//     refilled by a concurrent step/propose) and re-notifies if so;
+//     this is the load-bearing trick that catches the race where
+//     `notify` saw NOTIFIED + skipped the push because the slot was
+//     "already in queue", but work arrived after process_ready had
+//     drained it.
+//
+// The atomics make the design safe for concurrent notify callers (a
+// future transport thread receiving inbound messages off-pump). With a
+// single-threaded pump today the contention is zero; the atomics are
+// free.
+
+const NOTIFY_IDLE: u8 = 0;
+const NOTIFY_NOTIFIED: u8 = 1;
+const NOTIFY_DROP: u8 = 2;
+
 /// Per-group state held by the manager: the raw raft node plus a
 /// caller-drained outbox of outbound messages produced by the
 /// most recent `processReady` cycles.
@@ -333,15 +374,51 @@ struct GroupSlot {
     /// queries this between every `processReady` to ferry
     /// messages to peer nodes.
     outbox: Vec<(u64, Vec<u8>)>,
+    /// Mailbox state — `NOTIFY_IDLE` / `NOTIFY_NOTIFIED` / `NOTIFY_DROP`.
+    /// See the `mailbox` block-comment above.
+    state: AtomicU8,
 }
 
-/// Multi-raft manager. Caller-serialized.
+/// Multi-raft manager. Caller-serialized for the high-volume per-
+/// group ops (propose/step/process_ready/take_messages); `notify` is
+/// safe to call from any thread.
 ///
 /// cbindgen:opaque
 pub struct RaftManager {
     groups: HashMap<u64, GroupSlot>,
     tombstones: HashSet<u64>,
+    /// FIFO of group ids that have work pending — populated by
+    /// `notify_locked`, drained by `raft_manager_poll_ready`. May
+    /// contain stale ids (group destroyed between notify and drain);
+    /// the per-id ops tolerate "unknown group" as a no-op.
+    pending: Mutex<VecDeque<u64>>,
     logger: Logger,
+}
+
+/// CAS-flip a slot from IDLE→NOTIFIED. On success push the
+/// `group_id` onto `pending` so the next `poll_ready` returns it.
+/// On any other prior state (NOTIFIED → already in queue, DROP →
+/// destroyed), no-op. The slot reference is borrowed for the CAS
+/// only; the `pending` push happens after we release that borrow so
+/// the lock order is consistent (`pending.lock()` is never held
+/// across slot access).
+fn notify_locked(slot_state: &AtomicU8, pending: &Mutex<VecDeque<u64>>, group_id: u64) {
+    // `compare_exchange` semantics: only the IDLE→NOTIFIED transition
+    // pushes onto `pending`. Concurrent notifies after the first see
+    // NOTIFIED and skip.
+    if slot_state
+        .compare_exchange(
+            NOTIFY_IDLE,
+            NOTIFY_NOTIFIED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        if let Ok(mut q) = pending.lock() {
+            q.push_back(group_id);
+        }
+    }
 }
 
 #[no_mangle]
@@ -349,6 +426,7 @@ pub extern "C" fn raft_manager_new() -> *mut RaftManager {
     Box::into_raw(Box::new(RaftManager {
         groups: HashMap::new(),
         tombstones: HashSet::new(),
+        pending: Mutex::new(VecDeque::new()),
         logger: Logger::root(Discard, o!()),
     }))
 }
@@ -399,8 +477,13 @@ pub unsafe extern "C" fn raft_manager_create_group(
                 GroupSlot {
                     node,
                     outbox: Vec::new(),
+                    state: AtomicU8::new(NOTIFY_IDLE),
                 },
             );
+            // A fresh group has no committed entries / no outbound
+            // messages — no notify on create. The first `propose` /
+            // `step` / `campaign` is what kicks the group into the
+            // ready channel.
             0
         }
         Err(_) => -3,
@@ -413,6 +496,14 @@ pub unsafe extern "C" fn raft_manager_destroy_group(
     group_id: u64,
 ) -> i32 {
     let mgr = &mut *m;
+    // Set DROP before removing so any in-flight `notify` racing with
+    // destroy sees DROP and skips the push. (Notify holds the slot
+    // borrow only across the CAS; the slot itself is gone after
+    // `remove`, but stale group_ids in `pending` are harmless —
+    // per-id ops treat unknown groups as no-ops.)
+    if let Some(slot) = mgr.groups.get(&group_id) {
+        slot.state.store(NOTIFY_DROP, Ordering::Release);
+    }
     if mgr.groups.remove(&group_id).is_some() {
         mgr.tombstones.insert(group_id);
         0
@@ -469,9 +560,17 @@ pub unsafe extern "C" fn raft_manager_group_count(m: *const RaftManager) -> usiz
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_tick(m: *mut RaftManager, group_id: u64) -> i32 {
     let mgr = &mut *m;
+    let pending = &mgr.pending;
     match mgr.groups.get_mut(&group_id) {
         Some(slot) => {
             slot.node.tick();
+            // Tick on an idle follower usually produces nothing; only
+            // notify when raft state actually has new work. Cheap
+            // `has_ready` + `is_empty` checks gate the CAS, so the
+            // common idle-tick path doesn't even touch the atomic.
+            if slot.node.has_ready() || !slot.outbox.is_empty() {
+                notify_locked(&slot.state, pending, group_id);
+            }
             0
         }
         None => -1,
@@ -481,9 +580,14 @@ pub unsafe extern "C" fn raft_manager_tick(m: *mut RaftManager, group_id: u64) -
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_campaign(m: *mut RaftManager, group_id: u64) -> i32 {
     let mgr = &mut *m;
+    let pending = &mgr.pending;
     match mgr.groups.get_mut(&group_id) {
         Some(slot) => match slot.node.campaign() {
-            Ok(()) => 0,
+            Ok(()) => {
+                // campaign generates vote requests — always notify.
+                notify_locked(&slot.state, pending, group_id);
+                0
+            }
             Err(_) => -2,
         },
         None => -1,
@@ -508,7 +612,10 @@ pub unsafe extern "C" fn raft_manager_propose(
         slice::from_raw_parts(data, len).to_vec()
     };
     match slot.node.propose(vec![], bytes) {
-        Ok(()) => 0,
+        Ok(()) => {
+            notify_locked(&slot.state, &mgr.pending, group_id);
+            0
+        }
         Err(_) => -2,
     }
 }
@@ -539,7 +646,10 @@ pub unsafe extern "C" fn raft_manager_step(
         Err(_) => return -2,
     };
     match slot.node.step(msg) {
-        Ok(()) => 0,
+        Ok(()) => {
+            notify_locked(&slot.state, &mgr.pending, group_id);
+            0
+        }
         Err(_) => -3,
     }
 }
@@ -556,9 +666,10 @@ pub unsafe extern "C" fn raft_manager_take_messages(
     userdata: *mut c_void,
 ) -> i32 {
     let mgr = &mut *m;
+    // Stale id tolerance: see `raft_manager_process_ready`.
     let slot = match mgr.groups.get_mut(&group_id) {
         Some(s) => s,
-        None => return -1,
+        None => return 0,
     };
     // drain(..) yields ownership of each (to, Vec<u8>); the Vec
     // is dropped after the callback returns, so the pointer
@@ -586,9 +697,13 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     userdata: *mut c_void,
 ) -> i32 {
     let mgr = &mut *m;
+    // Stale id (group destroyed between notify and drain) → no-op.
+    // The ready-channel design guarantees the caller may see ids
+    // for groups that have since vanished; treating that as success
+    // lets the caller loop without filtering.
     let slot = match mgr.groups.get_mut(&group_id) {
         Some(s) => s,
-        None => return -1,
+        None => return 0,
     };
     if !slot.node.has_ready() {
         return 0;
@@ -686,10 +801,16 @@ fn push_messages(outbox: &mut Vec<(u64, Vec<u8>)>, msgs: Vec<Message>) {
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_tick_all(m: *mut RaftManager) -> usize {
     let mgr = &mut *m;
-    for slot in mgr.groups.values_mut() {
+    let pending = &mgr.pending;
+    let mut count = 0;
+    for (gid, slot) in mgr.groups.iter_mut() {
         slot.node.tick();
+        if slot.node.has_ready() || !slot.outbox.is_empty() {
+            notify_locked(&slot.state, pending, *gid);
+        }
+        count += 1;
     }
-    mgr.groups.len()
+    count
 }
 
 /// Batched per-group tick — caller supplies the set of group ids to
@@ -718,15 +839,33 @@ pub unsafe extern "C" fn raft_manager_tick_groups(
     let mgr = &mut *m;
     let ids = std::slice::from_raw_parts(group_ids, count);
     let mut ticked = 0;
+    let pending = &mgr.pending;
     for &gid in ids {
         if let Some(slot) = mgr.groups.get_mut(&gid) {
             slot.node.tick();
+            if slot.node.has_ready() || !slot.outbox.is_empty() {
+                notify_locked(&slot.state, pending, gid);
+            }
             ticked += 1;
         }
     }
     ticked
 }
 
+/// Drain up to `cap` group ids from the manager's ready channel into
+/// `out_buf`. Returns the count written. Group ids in the channel
+/// arrive via `notify_locked` — every op that produces work pushes
+/// the owning group exactly once between successive `release`s for
+/// that group.
+///
+/// O(returned count) — no scan of `mgr.groups`. The previous shape
+/// iterated all registered groups every cycle and was the K=10k
+/// scaling wall.
+///
+/// Stale ids (group destroyed between notify and drain) may be
+/// returned; per-id ops (`process_ready`, `take_messages`,
+/// `release`) tolerate unknown groups as no-ops. The caller doesn't
+/// need to filter.
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_poll_ready(
     m: *const RaftManager,
@@ -737,23 +876,61 @@ pub unsafe extern "C" fn raft_manager_poll_ready(
         return 0;
     }
     let mgr = &*m;
-    let mut count = 0usize;
-    for (gid, slot) in mgr.groups.iter() {
-        if count >= cap {
-            break;
-        }
-        // A group is "ready to drain" if raft thinks so OR if the
-        // outbox still has buffered outbound messages from a
-        // previous processReady that the caller hasn't fetched yet.
-        // The latter case is important for multi-node: the caller
-        // may want to schedule the take_messages cycle separately
-        // from has_ready.
-        if slot.node.has_ready() || !slot.outbox.is_empty() {
-            ptr::write(out_buf.add(count), *gid);
-            count += 1;
-        }
+    let mut q = match mgr.pending.lock() {
+        Ok(q) => q,
+        Err(_) => return 0,
+    };
+    let n = std::cmp::min(cap, q.len());
+    for i in 0..n {
+        // Unwrap: we drained no more than `q.len()`.
+        ptr::write(out_buf.add(i), q.pop_front().unwrap());
     }
-    count
+    n
+}
+
+/// Release a group back to IDLE after the caller has finished its
+/// per-group work (process_ready + take_messages). If new work
+/// landed during the round — propose / step / tick fired and saw
+/// state NOTIFIED so didn't push — `release` catches it: after
+/// state→IDLE, we check `has_ready` + outbox, and if either is
+/// non-empty, re-notify so the next `poll_ready` returns this group.
+///
+/// Returns 0 on success, -1 if the group is unknown (treated as a
+/// no-op: stale ids in the pending queue land here and we just drop
+/// them).
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_release(
+    m: *mut RaftManager,
+    group_id: u64,
+) -> i32 {
+    let mgr = &mut *m;
+    let pending = &mgr.pending;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    // Don't reset a DROP state — the slot is on its way out, and
+    // anyone notifying it now should keep seeing DROP.
+    let prev = slot
+        .state
+        .compare_exchange(
+            NOTIFY_NOTIFIED,
+            NOTIFY_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .ok();
+    if prev.is_none() {
+        // State was DROP (or IDLE — caller shouldn't call release
+        // on something they didn't drain, but tolerate it).
+        return 0;
+    }
+    // Race check: did work land between process_ready returning and
+    // our state→IDLE? If so, raft state reflects it; re-notify.
+    if slot.node.has_ready() || !slot.outbox.is_empty() {
+        notify_locked(&slot.state, pending, group_id);
+    }
+    0
 }
 
 unsafe fn apply_committed(

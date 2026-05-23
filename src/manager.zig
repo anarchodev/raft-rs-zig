@@ -190,10 +190,27 @@ pub const Manager = struct {
 
     /// Drive `group_id`'s pending applies through `callback`.
     /// Called once per applied entry. `userdata` is passed
-    /// through verbatim.
+    /// through verbatim. Returns success (no-op) on an unknown
+    /// group id — the ready channel is allowed to surface ids for
+    /// groups that have since been destroyed.
     pub fn processReady(self: *Manager, group_id: u64, callback: ApplyCb, userdata: ?*anyopaque) Error!void {
         if (c.raft_manager_process_ready(self.ptr, group_id, callback, userdata) != 0)
             return Error.ProcessReadyFailed;
+    }
+
+    /// Release a group back to IDLE after the caller has drained
+    /// its pending work (`processReady` + `takeMessages`). If new
+    /// work landed during the round, the slot is re-notified so
+    /// the next `pollReady` returns it. Unknown group ids are
+    /// success-no-op (stale ids from the ready channel can land
+    /// here after destroyGroup).
+    ///
+    /// Pair-with-pollReady invariant: every group id returned by
+    /// `pollReady` must be `release`d before the next `pollReady`
+    /// can see it again. The pump loop's natural shape — drain,
+    /// process each, release each — satisfies this.
+    pub fn release(self: *Manager, group_id: u64) void {
+        _ = c.raft_manager_release(self.ptr, group_id);
     }
 
     pub fn isLeader(self: *const Manager, group_id: u64) bool {
