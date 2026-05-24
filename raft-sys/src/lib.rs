@@ -654,6 +654,70 @@ pub unsafe extern "C" fn raft_manager_step(
     }
 }
 
+/// One entry in a batched step call: `(group_id, msg_bytes, msg_len)`.
+/// `msg_bytes` is the rust-protobuf serialization of a
+/// `raft::eraftpb::Message` (same as `raft_manager_step`). Layout is
+/// stable C ABI; callers building this array on the Zig side use
+/// `extern struct` so the layout matches exactly.
+#[repr(C)]
+pub struct RaftStepBatchEntry {
+    pub group_id: u64,
+    pub msg_bytes: *const u8,
+    pub msg_len: usize,
+}
+
+/// Batch-step many inbound raft messages in one FFI call. For each
+/// entry, locate the group, decode the message, step it. **Bad
+/// entries are skipped silently** — unknown groups, decode failures,
+/// and step-rejected messages all count as no-ops without aborting
+/// the rest of the batch. Returns the count of successful steps.
+///
+/// Mirrors `raft_manager_tick_groups`' skip-bad semantics: the batch
+/// API is for "fast path" delivery of trusted, well-formed messages
+/// from a peer; for per-message error inspection use `raft_manager_step`
+/// instead.
+///
+/// One FFI call per batch — the Zig↔C↔Rust boundary crossing is the
+/// bulk of the per-message cost; amortizing it across an envelope of
+/// N messages compounds with transport coalescing.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_step_batch(
+    m: *mut RaftManager,
+    entries: *const RaftStepBatchEntry,
+    count: usize,
+) -> usize {
+    if m.is_null() || count == 0 || entries.is_null() {
+        return 0;
+    }
+    let mgr = &mut *m;
+    let entries = slice::from_raw_parts(entries, count);
+    let mut stepped: usize = 0;
+    let pending = &mgr.pending;
+    for e in entries {
+        if e.msg_bytes.is_null() && e.msg_len > 0 {
+            continue; // malformed entry (null ptr with non-zero len)
+        }
+        let slot = match mgr.groups.get_mut(&e.group_id) {
+            Some(s) => s,
+            None => continue, // unknown group, skip
+        };
+        let bytes = if e.msg_len == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(e.msg_bytes, e.msg_len)
+        };
+        let msg = match Message::parse_from_bytes(bytes) {
+            Ok(m) => m,
+            Err(_) => continue, // decode failure, skip
+        };
+        if slot.node.step(msg).is_ok() {
+            notify_locked(&slot.state, pending, e.group_id);
+            stepped += 1;
+        }
+    }
+    stepped
+}
+
 /// Drain the group's outbox of outbound raft messages. `cb` fires
 /// once per message in FIFO order; the message bytes are valid only
 /// for the duration of the callback (Rust frees them after).

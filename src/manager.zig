@@ -250,6 +250,31 @@ pub const Manager = struct {
             else => Error.StepFailed,
         };
     }
+
+    /// Batch-step many inbound messages in one FFI call. Returns
+    /// the count of successful steps; unknown groups, decode
+    /// failures, and step-rejected messages are silently skipped
+    /// (mirrors `tickGroups`' skip-bad semantics).
+    ///
+    /// Use this on the receive side of a coalesced multi-raft
+    /// transport — one envelope carries N groups' messages to
+    /// the same node, and one `stepBatch` call delivers them all
+    /// without N round-trips through the Zig↔C↔Rust FFI boundary.
+    /// For per-message error reporting use single-msg `step`.
+    pub fn stepBatch(self: *Manager, entries: []const StepBatchEntry) usize {
+        if (entries.len == 0) return 0;
+        return c.raft_manager_step_batch(self.ptr, @ptrCast(entries.ptr), entries.len);
+    }
+};
+
+/// One entry in a `stepBatch` call. Layout matches the C ABI
+/// `RaftStepBatchEntry` exactly (extern struct guarantees that),
+/// so a `[]const StepBatchEntry` can be passed straight through
+/// to the FFI with no copy.
+pub const StepBatchEntry = extern struct {
+    group_id: u64,
+    msg_ptr: [*]const u8,
+    msg_len: usize,
 };
 
 // ── Tests ──────────────────────────────────────────────────────────────────
