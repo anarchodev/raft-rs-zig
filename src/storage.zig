@@ -122,6 +122,28 @@ pub const MemStorage = struct {
         self.entries.shrinkRetainingCapacity(self.entries.items.len - offset);
     }
 
+    /// Reset the log to a compacted snapshot point: discard every entry
+    /// and set the sentinel to {index, term}. `first_index` becomes
+    /// `index + 1`. Recovery uses this when a compaction record says the
+    /// log starts above 1 — the state through `index` lives in the
+    /// application's snapshot (kvexp), not the raft log, so there are no
+    /// entries to replay below it, only a sentinel to anchor `term`.
+    pub fn resetToSnapshot(self: *MemStorage, index: u64, term: u64) !void {
+        for (self.entries.items) |e| {
+            if (e.data.len > 0) self.allocator.free(e.data);
+            if (e.context.len > 0) self.allocator.free(e.context);
+        }
+        self.entries.clearRetainingCapacity();
+        try self.entries.append(self.allocator, .{
+            .entry_type = 0,
+            .term = term,
+            .index = index,
+            .data = &.{},
+            .context = &.{},
+            .sync_log = false,
+        });
+    }
+
     fn appendOne(self: *MemStorage, e: c.RaftEntryFfi) !void {
         const last_idx = self.lastIndex();
         if (e.index <= last_idx) {

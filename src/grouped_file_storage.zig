@@ -55,14 +55,31 @@
 //! same index — last-authoritative-entry per group falls out for free,
 //! and the rebuilt `entry_offsets` point at the surviving records.
 //!
-//! Out of scope for this slice (separate work, noted so nobody assumes
-//! it's done): **segment GC** and a **per-group compaction watermark**.
-//! Those need the log to be *segmented* (it is one file today) and to
-//! persist snapshots (snapshot bytes are not WAL-backed yet), so they
-//! are a distinct piece, not part of recovery. Until then the full log
-//! is always present, so replay reconstructs the complete entry stream
-//! plus the latest hard state — which is exactly correct for a log that
-//! never compacts.
+//! ## Segmentation + GC (bounding the WAL)
+//!
+//! Compaction (see `GroupedFileStorage.compact`) advances a group's
+//! `first_index` and marks records dead, but the bytes stay on disk
+//! until a whole segment can be reclaimed. The WAL is therefore chopped
+//! into segments: the **active** segment is always the base path, and a
+//! roll (when it passes `segment_target`) seals it by renaming to
+//! `{base}.{seg_no}` and opens a fresh active at the base path again.
+//! (Keeping the active at the base path means the never-rolled case is
+//! byte-identical to a plain single-file WAL — every unsegmented test
+//! exercises that path unchanged.)
+//!
+//! A sealed segment is deleted once every group that wrote entries into
+//! it has a compaction watermark at or above the highest index it wrote
+//! there — i.e. the segment holds no live entries. Hard state would
+//! otherwise pin old segments for quiet groups, so each new segment
+//! opens with a **header**: the WAL caches the latest hard state per
+//! group (it sees every hard-state record go by) and re-emits all of
+//! them into each fresh segment. That way the newest segment always
+//! carries every live group's hard state, GC of older segments never
+//! loses it, and recovery — replaying sealed segments oldest-first then
+//! the active — sees the latest hard state win. Compaction watermarks
+//! are not persisted: they rebuild as groups re-compact after a restart
+//! (compaction is a space optimization; re-applying already-applied
+//! entries is idempotent in the layer above).
 
 const std = @import("std");
 const c = @cImport({
@@ -76,6 +93,12 @@ pub const Tag = enum(u8) {
     entry = 1,
     hardstate = 2,
     confstate = 3,
+    /// A compaction marker: "this group's log is compacted through
+    /// {index, term}". Payload = [index:u64 LE][term:u64 LE]. Written by
+    /// `GroupedFileStorage.compact`, re-baselined into every later
+    /// segment header (like hard state), and consumed by recovery to
+    /// anchor the log sentinel above 1 so a GC'd prefix is not a gap.
+    compaction = 4,
 };
 
 /// Length of the per-record header: tag + group_id + payload_len.
@@ -103,45 +126,102 @@ pub const RecoveredRecord = struct {
     payload: []u8,
 };
 
-/// One shared WAL file across all groups on a single cluster-node.
+/// Hard-state record payload length: term + vote + commit, all u64.
+const HS_PAYLOAD_LEN: usize = 24;
+/// Compaction record payload length: index + term, both u64.
+const COMPACTION_PAYLOAD_LEN: usize = 16;
+
+/// Default segment roll threshold. A deployment tunes this; it only
+/// affects how finely the WAL is chopped for GC, never correctness.
+/// Large enough that the single-file tests never roll (so they exercise
+/// the unsegmented path unchanged).
+pub const DEFAULT_SEGMENT_TARGET: u64 = 64 * 1024 * 1024;
+
+/// A sealed (no-longer-active) WAL segment, tracked for GC. Its file is
+/// `{base}.{seg_no:0>6}`. `group_max` is the highest entry index each
+/// group wrote into it; once every such group's compaction watermark
+/// reaches that index the segment holds no live entries and is deleted.
+/// Hard state never blocks GC — it's re-baselined into every later
+/// segment's header.
+const SealedSegment = struct {
+    seg_no: u64,
+    group_max: std.AutoHashMap(u64, u64),
+};
+
+/// Format the on-disk path of a sealed segment into `buf`.
+fn sealedSegmentPath(buf: []u8, base_path: []const u8, seg_no: u64) ![]u8 {
+    return std.fmt.bufPrint(buf, "{s}.{d:0>6}", .{ base_path, seg_no });
+}
+
+/// One shared, segmented WAL across all groups on a single cluster-node.
 /// Construction + flush are the dispatcher's responsibility; group
-/// storages borrow `*SharedWal` via `GroupedFileStorage.init` and
-/// write through `appendRecord`.
+/// storages borrow `*SharedWal` via `GroupedFileStorage.init` and write
+/// through `appendRecord`. See the module doc for the segmentation / GC
+/// model.
 ///
-/// Single-threaded by contract: the dispatcher pumps one ready group
-/// at a time per node, so the file handle + offset + scratch buffer
-/// are accessed serially. If the dispatcher ever parallelizes per-
-/// group processReady, this struct needs a mutex on `wal_offset` +
-/// `file.writevAll` (and per-group scratch — already on
-/// `GroupedFileStorage`, not here).
+/// Single-threaded by contract: the dispatcher pumps one ready group at
+/// a time per node, so the file handle, offset, and caches are accessed
+/// serially. If per-group processReady is ever parallelized, this needs
+/// a mutex around the write head + the caches.
 pub const SharedWal = struct {
     allocator: std.mem.Allocator,
+    /// The ACTIVE segment — always at `wal_path` (no suffix). A roll
+    /// seals it by renaming to `{wal_path}.{seg_no}` and opens a fresh
+    /// active here. Named `file` (not `active`) so existing callers that
+    /// reach `wal.file` keep working.
     file: std.fs.File,
+    /// Path of the active segment (the base path).
     wal_path: []u8,
-    /// Monotonic write head — used to record per-group entry offsets
-    /// before each append so the per-group map stays in lockstep.
+    /// Bytes written into the ACTIVE segment. Resets (to the header
+    /// size) on each roll.
     wal_offset: u64,
+    /// Roll threshold: when `wal_offset` reaches this, the next
+    /// `appendRecord` seals the active segment and starts a new one.
+    segment_target: u64,
+    /// Next sealed-segment number to hand out (monotonic, starts at 1).
+    next_seg_no: u64,
+    /// Sealed segments, oldest first, tracked for GC.
+    sealed: std.ArrayList(SealedSegment),
+    /// Highest entry index each group has written into the ACTIVE
+    /// segment. Moves into the new `SealedSegment` on roll.
+    active_group_max: std.AutoHashMap(u64, u64),
+    /// Latest hard-state payload seen per group, re-emitted as each new
+    /// segment's header so GC of older segments never drops a quiet
+    /// group's hard state. Updated on every hard-state append.
+    hardstate_cache: std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8),
+    /// Latest compaction-marker payload seen per group, re-emitted in
+    /// each new segment's header alongside hard state — so recovery can
+    /// always find a group's snapshot point even after the segment that
+    /// first recorded it has been GC'd.
+    compaction_cache: std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8),
+    /// Per-group compaction watermark (mirrors each group's
+    /// `compaction_index`), pushed in via `noteCompaction`; drives GC.
+    /// Not persisted — rebuilt as groups re-compact after a restart.
+    compaction: std.AutoHashMap(u64, u64),
     /// Records recovered by `open`, bucketed by `group_id` in file
-    /// order, awaiting replay. Empty after `init` (fresh start). Each
-    /// group drains its bucket in `GroupedFileStorage.initRecover`;
-    /// `deinit` frees any bucket that was never drained.
+    /// order, awaiting replay. Empty after `init`. Each group drains its
+    /// bucket in `GroupedFileStorage.initRecover`; `deinit` frees any
+    /// bucket that was never drained.
     recovered: std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
 
-    /// Fresh start: truncate any existing file to empty. Use `open`
-    /// instead to recover an existing WAL across a restart. (Tests,
-    /// benchmarks, and any caller that genuinely wants a clean slate
-    /// use this; production boot uses `open`.)
+    /// Fresh start with the default segment size.
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) !*SharedWal {
+        return initWithTarget(allocator, wal_path, DEFAULT_SEGMENT_TARGET);
+    }
+
+    /// Fresh start: truncate any existing active file to empty. Use
+    /// `open` instead to recover an existing WAL. `segment_target` is
+    /// the roll threshold (tests pass a small value to force rolls).
+    pub fn initWithTarget(
+        allocator: std.mem.Allocator,
+        wal_path: []const u8,
+        segment_target: u64,
+    ) !*SharedWal {
         const self = try allocator.create(SharedWal);
         errdefer allocator.destroy(self);
-
         const path_dup = try allocator.dupe(u8, wal_path);
         errdefer allocator.free(path_dup);
-
-        const file = try std.fs.cwd().createFile(wal_path, .{
-            .truncate = true,
-            .read = false,
-        });
+        const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = true, .read = false });
         errdefer file.close();
 
         self.* = .{
@@ -149,49 +229,93 @@ pub const SharedWal = struct {
             .file = file,
             .wal_path = path_dup,
             .wal_offset = 0,
+            .segment_target = segment_target,
+            .next_seg_no = 1,
+            .sealed = .empty,
+            .active_group_max = std.AutoHashMap(u64, u64).init(allocator),
+            .hardstate_cache = std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8).init(allocator),
+            .compaction_cache = std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8).init(allocator),
+            .compaction = std.AutoHashMap(u64, u64).init(allocator),
             .recovered = std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)).init(allocator),
         };
         return self;
     }
 
-    /// Crash-recovery start: open an existing WAL (or create it if
-    /// absent), replay-scan it, truncate any torn tail, and position
-    /// the write head at the durable prefix end. Recovered records are
-    /// bucketed by group in `self.recovered`; callers re-create each
-    /// group via `GroupedFileStorage.initRecover`, which drains the
-    /// matching bucket. See the module doc comment for the recovery
-    /// model and what it deliberately does not yet cover.
+    /// Crash-recovery start with the default segment size.
     pub fn open(allocator: std.mem.Allocator, wal_path: []const u8) !*SharedWal {
-        const self = try allocator.create(SharedWal);
-        errdefer allocator.destroy(self);
+        return openWithTarget(allocator, wal_path, DEFAULT_SEGMENT_TARGET);
+    }
 
-        const path_dup = try allocator.dupe(u8, wal_path);
-        errdefer allocator.free(path_dup);
-
-        // truncate=false → preserve existing bytes; read=true → allow
-        // the positional reads the scan needs. Creates an empty file on
-        // first boot.
-        const file = try std.fs.cwd().createFile(wal_path, .{
-            .truncate = false,
-            .read = true,
-        });
-        errdefer file.close();
-
+    /// Crash-recovery start: discover the sealed segments, replay-scan
+    /// them oldest-first then the active segment (truncating the
+    /// active's torn tail), rebuild the GC + hard-state caches, and
+    /// position the write head to continue the active segment. Recovered
+    /// records are bucketed by group in `self.recovered`; callers
+    /// re-create each group via `GroupedFileStorage.initRecover`.
+    pub fn openWithTarget(
+        allocator: std.mem.Allocator,
+        wal_path: []const u8,
+        segment_target: u64,
+    ) !*SharedWal {
+        // Build the recovered state in locals so the final assembly into
+        // `self.*` is infallible (no half-initialized struct to unwind).
         var recovered = std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)).init(allocator);
         errdefer freeRecovered(allocator, &recovered);
+        var sealed: std.ArrayList(SealedSegment) = .empty;
+        errdefer {
+            for (sealed.items) |*s| s.group_max.deinit();
+            sealed.deinit(allocator);
+        }
+        var active_group_max = std.AutoHashMap(u64, u64).init(allocator);
+        errdefer active_group_max.deinit();
+        var hardstate_cache = std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8).init(allocator);
+        errdefer hardstate_cache.deinit();
+        var compaction_cache = std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8).init(allocator);
+        errdefer compaction_cache.deinit();
 
-        const valid_end = try scanForReplay(allocator, file, &recovered);
+        const seg_nos = try discoverSealedSegments(allocator, wal_path);
+        defer allocator.free(seg_nos);
 
-        // Drop the torn tail (if any) and position the write head at the
-        // durable prefix end so the next `appendRecord` continues cleanly.
+        // Sealed segments were fsynced before sealing, so they are
+        // intact; scan each fully (oldest first) so cross-segment replay
+        // order and last-hard-state-wins hold.
+        var max_seg_no: u64 = 0;
+        for (seg_nos) |sn| {
+            var gm = std.AutoHashMap(u64, u64).init(allocator);
+            errdefer gm.deinit();
+            var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+            const p = try sealedSegmentPath(&pbuf, wal_path, sn);
+            const f = try std.fs.cwd().openFile(p, .{});
+            defer f.close();
+            _ = try scanForReplay(allocator, f, &recovered, &gm, &hardstate_cache, &compaction_cache);
+            try sealed.append(allocator, .{ .seg_no = sn, .group_max = gm });
+            if (sn > max_seg_no) max_seg_no = sn;
+        }
+
+        // The active segment is the only one that can have a torn tail.
+        const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = false, .read = true });
+        errdefer file.close();
+        const valid_end = try scanForReplay(allocator, file, &recovered, &active_group_max, &hardstate_cache, &compaction_cache);
         try file.setEndPos(valid_end);
         try file.seekTo(valid_end);
+
+        const self = try allocator.create(SharedWal);
+        errdefer allocator.destroy(self);
+        const path_dup = try allocator.dupe(u8, wal_path);
+        errdefer allocator.free(path_dup);
 
         self.* = .{
             .allocator = allocator,
             .file = file,
             .wal_path = path_dup,
             .wal_offset = valid_end,
+            .segment_target = segment_target,
+            .next_seg_no = max_seg_no + 1,
+            .sealed = sealed,
+            .active_group_max = active_group_max,
+            .hardstate_cache = hardstate_cache,
+            .compaction_cache = compaction_cache,
+            .compaction = std.AutoHashMap(u64, u64).init(allocator),
             .recovered = recovered,
         };
         return self;
@@ -201,41 +325,75 @@ pub const SharedWal = struct {
         self.file.close();
         const a = self.allocator;
         freeRecovered(a, &self.recovered);
+        for (self.sealed.items) |*s| s.group_max.deinit();
+        self.sealed.deinit(a);
+        self.active_group_max.deinit();
+        self.hardstate_cache.deinit();
+        self.compaction_cache.deinit();
+        self.compaction.deinit();
         a.free(self.wal_path);
         a.destroy(self);
     }
 
     /// Hand a group its recovered records (ownership transfers to the
     /// caller, which must free each `payload` and `deinit` the list).
-    /// Removes the bucket from `recovered` so `deinit` won't double-free
-    /// it. Returns null for a group with nothing to replay.
+    /// Removes the bucket so `deinit` won't double-free it. Null when
+    /// the group has nothing to replay.
     pub fn takeRecovered(self: *SharedWal, group_id: u64) ?std.ArrayList(RecoveredRecord) {
         if (self.recovered.fetchRemove(group_id)) |kv| return kv.value;
         return null;
     }
 
-    /// fsync the WAL. The dispatcher calls this ONCE per pump cycle
-    /// after every ready group has run processReady (and every
-    /// vtable write callback has returned). This is the load-bearing
-    /// "one fsync amortizes K groups" point — the entire reason
-    /// SharedWal exists.
+    /// fsync the active segment. The dispatcher calls this ONCE per pump
+    /// cycle after every ready group has run processReady — the
+    /// load-bearing "one fsync amortizes K groups" point. (Sealed
+    /// segments were already fsynced at seal time.)
     pub fn flush(self: *SharedWal) !void {
         try self.file.sync();
     }
 
-    /// Append one record to the shared file. Returns the file offset
-    /// the record was written at — the caller's per-group
-    /// `entry_offsets` records this so a later tail-truncate can map
-    /// "entry index N" back to its byte range.
-    ///
-    /// `payload` is the body bytes only; this function frames the
-    /// header (tag + group_id + payload_len) and trailer (crc32).
+    /// Append one record to the WAL, rolling to a new segment first if
+    /// the active one has reached `segment_target`. Returns the offset
+    /// within the active segment where the record was written. `payload`
+    /// is the body only; framing (header + crc trailer) is added here.
     pub fn appendRecord(
         self: *SharedWal,
         group_id: u64,
         tag: Tag,
         payload: []const u8,
     ) !u64 {
+        if (self.wal_offset >= self.segment_target) try self.roll();
+
+        // Maintain the GC + header caches from the append stream itself,
+        // so neither needs back-pointers to the groups.
+        switch (tag) {
+            .hardstate => if (payload.len == HS_PAYLOAD_LEN) {
+                var hs: [HS_PAYLOAD_LEN]u8 = undefined;
+                @memcpy(&hs, payload[0..HS_PAYLOAD_LEN]);
+                try self.hardstate_cache.put(group_id, hs);
+            },
+            .entry => if (payload.len >= 20) {
+                // Entry payload: entry_type u32, term u64, index u64, ...
+                const idx = std.mem.readInt(u64, payload[12..20], .little);
+                const gop = try self.active_group_max.getOrPut(group_id);
+                if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
+            },
+            .compaction => if (payload.len == COMPACTION_PAYLOAD_LEN) {
+                var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
+                @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
+                try self.compaction_cache.put(group_id, cp);
+            },
+            .confstate => {},
+        }
+
+        return self.writeFramed(group_id, tag, payload);
+    }
+
+    /// Frame and write one record into the active segment, advancing the
+    /// write head. The low-level write shared by `appendRecord` and the
+    /// roll-time header re-emit (which must not re-trigger a roll or
+    /// re-touch the caches).
+    fn writeFramed(self: *SharedWal, group_id: u64, tag: Tag, payload: []const u8) !u64 {
         var header: [HEADER_LEN]u8 = undefined;
         header[0] = @intFromEnum(tag);
         std.mem.writeInt(u64, header[1..9], group_id, .little);
@@ -257,7 +415,117 @@ pub const SharedWal = struct {
         self.wal_offset += HEADER_LEN + payload.len + TRAILER_LEN;
         return offset_before;
     }
+
+    /// Seal the active segment (fsync, close, rename to
+    /// `{base}.{seg_no}`) and open a fresh active at the base path,
+    /// re-emitting every cached hard state as the new segment's header.
+    fn roll(self: *SharedWal) !void {
+        try self.file.sync();
+        self.file.close();
+
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const sealed_path = try sealedSegmentPath(&pbuf, self.wal_path, self.next_seg_no);
+        try std.fs.cwd().rename(self.wal_path, sealed_path);
+
+        // The active segment's per-group entry maxima become the sealed
+        // segment's GC key; the active starts fresh.
+        try self.sealed.append(self.allocator, .{ .seg_no = self.next_seg_no, .group_max = self.active_group_max });
+        self.next_seg_no += 1;
+        self.active_group_max = std.AutoHashMap(u64, u64).init(self.allocator);
+
+        self.file = try std.fs.cwd().createFile(self.wal_path, .{ .truncate = true, .read = false });
+        self.wal_offset = 0;
+
+        // Header: re-baseline every live group's hard state and
+        // compaction marker, so older segments hold the only copy of
+        // neither.
+        var it = self.hardstate_cache.iterator();
+        while (it.next()) |e| {
+            _ = try self.writeFramed(e.key_ptr.*, .hardstate, e.value_ptr.*[0..]);
+        }
+        var cit = self.compaction_cache.iterator();
+        while (cit.next()) |e| {
+            _ = try self.writeFramed(e.key_ptr.*, .compaction, e.value_ptr.*[0..]);
+        }
+    }
+
+    /// Record group `group_id`'s compaction watermark and reclaim any
+    /// sealed segment that now holds no live entries. Called by
+    /// `GroupedFileStorage.compact`.
+    pub fn noteCompaction(self: *SharedWal, group_id: u64, watermark: u64) !void {
+        try self.compaction.put(group_id, watermark);
+        self.gcSealed();
+    }
+
+    /// Declare a group permanently gone (an *intentional* migration
+    /// detach — NOT ordinary storage teardown, which must preserve
+    /// records for restart recovery). Drops the group from every cache
+    /// so it stops being re-emitted / pinning segments, then GCs
+    /// anything it was holding open. The dispatcher calls this around
+    /// `destroyGroup`, never from `GroupedFileStorage.deinit`.
+    pub fn noteGroupDestroyed(self: *SharedWal, group_id: u64) void {
+        _ = self.hardstate_cache.remove(group_id);
+        _ = self.compaction_cache.remove(group_id);
+        _ = self.compaction.remove(group_id);
+        _ = self.active_group_max.remove(group_id);
+        for (self.sealed.items) |*s| _ = s.group_max.remove(group_id);
+        self.gcSealed();
+    }
+
+    /// Delete every sealed segment all of whose groups are compacted
+    /// past their highest index in it. Best-effort: a failed unlink
+    /// leaves a dead file that recovery just skips, so errors are
+    /// swallowed rather than propagated up the write path.
+    fn gcSealed(self: *SharedWal) void {
+        var i: usize = 0;
+        while (i < self.sealed.items.len) {
+            if (self.segmentDead(&self.sealed.items[i])) {
+                var seg = self.sealed.orderedRemove(i); // keep oldest-first order
+                var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+                if (sealedSegmentPath(&pbuf, self.wal_path, seg.seg_no)) |p| {
+                    std.fs.cwd().deleteFile(p) catch {};
+                } else |_| {}
+                seg.group_max.deinit();
+            } else i += 1;
+        }
+    }
+
+    fn segmentDead(self: *const SharedWal, seg: *const SealedSegment) bool {
+        var it = seg.group_max.iterator();
+        while (it.next()) |e| {
+            const wm = self.compaction.get(e.key_ptr.*) orelse 0;
+            if (e.value_ptr.* > wm) return false; // a live (un-compacted) entry remains
+        }
+        return true;
+    }
 };
+
+/// Discover the sealed-segment numbers for `wal_path` (files named
+/// `{basename}.{digits}` next to it), sorted ascending. Returns an empty
+/// slice if the directory can't be opened (fresh boot, no segments).
+fn discoverSealedSegments(allocator: std.mem.Allocator, wal_path: []const u8) ![]u64 {
+    const dir_path = std.fs.path.dirname(wal_path) orelse ".";
+    const base_name = std.fs.path.basename(wal_path);
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return &[_]u64{};
+    defer dir.close();
+
+    var list: std.ArrayList(u64) = .empty;
+    errdefer list.deinit(allocator);
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, base_name)) continue;
+        if (entry.name.len <= base_name.len + 1) continue; // the active segment itself, or no suffix
+        if (entry.name[base_name.len] != '.') continue;
+        const suffix = entry.name[base_name.len + 1 ..];
+        const sn = std.fmt.parseInt(u64, suffix, 10) catch continue; // non-numeric suffix → not ours
+        try list.append(allocator, sn);
+    }
+    std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
+    return list.toOwnedSlice(allocator);
+}
 
 /// Free every recovered bucket and the map itself. Used both by
 /// `SharedWal.deinit` (for buckets no group claimed) and by `open`'s
@@ -287,15 +555,24 @@ fn readFull(file: std.fs.File, buf: []u8, offset: u64) !usize {
     return total;
 }
 
-/// Walk the WAL from offset 0, CRC-validating each record and bucketing
-/// the valid ones by `group_id` (in file order) into `recovered`.
-/// Stops at the first record that is short-read or fails its CRC — that
-/// is the crash boundary; everything before it is the durable prefix.
-/// Returns the byte offset of that boundary (the durable prefix length).
+/// Walk one segment from offset 0, CRC-validating each record and
+/// bucketing the valid ones by `group_id` (in file order) into
+/// `recovered`. Stops at the first short-read or CRC failure — the
+/// crash boundary; everything before it is the durable prefix. Returns
+/// that boundary offset.
+///
+/// Also rebuilds GC + header state: each entry record updates
+/// `group_max[group_id]` to the max index seen (this segment's GC key),
+/// and each hard-state record updates `hardstate_cache[group_id]` (so,
+/// scanning segments oldest-first then the active, the cache ends at the
+/// latest hard state per group).
 fn scanForReplay(
     allocator: std.mem.Allocator,
     file: std.fs.File,
     recovered: *std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
+    group_max: *std.AutoHashMap(u64, u64),
+    hardstate_cache: *std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8),
+    compaction_cache: *std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8),
 ) !u64 {
     var off: u64 = 0;
     var header: [HEADER_LEN]u8 = undefined;
@@ -308,6 +585,7 @@ fn scanForReplay(
             1 => .entry,
             2 => .hardstate,
             3 => .confstate,
+            4 => .compaction,
             else => break, // unknown tag — garbage from a torn write
         };
         const group_id = std.mem.readInt(u64, header[1..9], .little);
@@ -327,6 +605,26 @@ fn scanForReplay(
         crc.update(header[0..]);
         crc.update(payload);
         if (crc.final() != std.mem.readInt(u32, trailer[0..], .little)) break; // corrupt
+
+        // Rebuild GC / header state from the record.
+        switch (tag) {
+            .entry => if (payload_len >= 20) {
+                const idx = std.mem.readInt(u64, payload[12..20], .little);
+                const gop = try group_max.getOrPut(group_id);
+                if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
+            },
+            .hardstate => if (payload_len == HS_PAYLOAD_LEN) {
+                var hs: [HS_PAYLOAD_LEN]u8 = undefined;
+                @memcpy(&hs, payload[0..HS_PAYLOAD_LEN]);
+                try hardstate_cache.put(group_id, hs);
+            },
+            .compaction => if (payload_len == COMPACTION_PAYLOAD_LEN) {
+                var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
+                @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
+                try compaction_cache.put(group_id, cp);
+            },
+            .confstate => {},
+        }
 
         const gop = try recovered.getOrPut(group_id);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -447,10 +745,39 @@ pub const GroupedFileStorage = struct {
                 for (bucket.items) |r| allocator.free(r.payload);
                 bucket.deinit(allocator);
             }
+
+            // Pre-pass: the highest compaction marker is the snapshot
+            // point. Entries at or below it were dropped by compaction —
+            // their state lives in the application snapshot, and the
+            // segment that held them may have been GC'd, so replaying
+            // them would gap. Anchor the sentinel there and skip them.
+            var snap_index: u64 = 0;
+            var snap_term: u64 = 0;
+            for (bucket.items) |r| {
+                if (r.tag == .compaction and r.payload.len == COMPACTION_PAYLOAD_LEN) {
+                    const idx = std.mem.readInt(u64, r.payload[0..8], .little);
+                    if (idx >= snap_index) {
+                        snap_index = idx;
+                        snap_term = std.mem.readInt(u64, r.payload[8..16], .little);
+                    }
+                }
+            }
+            if (snap_index > 0) {
+                try self.mem.resetToSnapshot(snap_index, snap_term);
+                self.compaction_index = snap_index;
+                self.entry_offsets.clearRetainingCapacity();
+                try self.entry_offsets.append(self.allocator, 0); // sentinel slot
+            }
+
             for (bucket.items) |r| switch (r.tag) {
-                .entry => try self.replayEntry(try parseEntryPayload(r.payload), r.offset),
+                .entry => {
+                    const e = try parseEntryPayload(r.payload);
+                    if (e.index <= snap_index) continue; // covered by the snapshot
+                    try self.replayEntry(e, r.offset);
+                },
                 .hardstate => self.replayHardState(try parseHardStatePayload(r.payload)),
-                .confstate => {}, // not produced today — skip, bytes already accounted
+                .compaction => {}, // consumed in the pre-pass
+                .confstate => {}, // not produced today
             };
         }
         return self;
@@ -515,9 +842,14 @@ pub const GroupedFileStorage = struct {
     }
 
     pub fn deinit(self: *GroupedFileStorage) void {
-        // NB: we do NOT close `self.wal` — it's borrowed; the
-        // dispatcher owns it and tears it down after all groups
-        // sharing it have been destroyed.
+        // NB: we do NOT close `self.wal` — it's borrowed; the dispatcher
+        // owns it and tears it down after all groups sharing it have
+        // been destroyed. We also do NOT call `wal.noteGroupDestroyed`
+        // here: `deinit` runs on ordinary shutdown too, and a group's
+        // WAL records must survive shutdown for restart recovery.
+        // Reclaiming a group's segments is an *intentional* migration-
+        // detach action — the dispatcher calls `wal.noteGroupDestroyed`
+        // explicitly for that, separate from storage teardown.
         self.mem.deinit();
         self.entry_offsets.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
@@ -544,6 +876,19 @@ pub const GroupedFileStorage = struct {
         self.entry_offsets.shrinkRetainingCapacity(self.entry_offsets.items.len - offset);
         self.entry_offsets.items[0] = 0; // sentinel slot carries no record
         self.compaction_index = index;
+
+        // Persist a compaction marker so recovery can anchor the log
+        // sentinel at {index, term} even after the segment that held the
+        // dropped entries is GC'd. The term is the sentinel's term (the
+        // term at the compact index), which mem.compact just preserved.
+        var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
+        std.mem.writeInt(u64, cp[0..8], index, .little);
+        std.mem.writeInt(u64, cp[8..16], self.mem.entries.items[0].term, .little);
+        _ = try self.wal.appendRecord(self.group_id, .compaction, &cp);
+
+        // Tell the WAL so it can reclaim any segment now fully below
+        // this (and every other group's) watermark.
+        try self.wal.noteCompaction(self.group_id, index);
     }
 
     fn writeEntryRecord(self: *GroupedFileStorage, e: c.RaftEntryFfi) !u64 {
@@ -1119,4 +1464,138 @@ test "GroupedFileStorage.compact: drops offset slots in lockstep with mem, advan
     try testing.expectEqual(@as(usize, 2), g.entry_offsets.items.len);
     try testing.expectEqual(@as(u64, 0), g.entry_offsets.items[0]);
     try testing.expectEqual(@as(u64, 94), g.entry_offsets.items[1]);
+}
+
+test "segmentation: rolling seals segments; the group keeps its full log" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 50);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+
+    // 47-byte records vs a 50-byte target → rolls between most entries.
+    var b = [_]c.RaftEntryFfi{
+        fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c"),
+        fakeEntry(1, 4, "d"), fakeEntry(1, 5, "e"),
+    };
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+
+    try testing.expect(wal.sealed.items.len >= 1);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try sealedSegmentPath(&pbuf, h.path, 1);
+    try std.fs.cwd().access(p, .{}); // the first sealed segment exists on disk
+    // The active stays at the base path; the in-memory log is intact.
+    try testing.expectEqual(@as(u64, 5), g.mem.lastIndex());
+}
+
+test "segment GC: sealed segments are deleted once the group compacts past them" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 50);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+
+    var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c"), fakeEntry(1, 4, "d") };
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+    try testing.expect(wal.sealed.items.len >= 1);
+
+    try g.compact(4); // drop everything ≤ 4 → every sealed segment is dead
+    try testing.expectEqual(@as(usize, 0), wal.sealed.items.len);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try sealedSegmentPath(&pbuf, h.path, 1);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(p, .{}));
+}
+
+test "segment GC: a segment shared with a still-live group is not deleted" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 60);
+    defer wal.deinit();
+    const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    const g2 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 2);
+    defer g2.deinit();
+
+    // g1@1 and g2@1 land in the first segment; the next append rolls it.
+    var a1 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "a")};
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &a1, 1));
+    var a2 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "b")};
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g2, &a2, 1));
+    var a3 = [_]c.RaftEntryFfi{fakeEntry(1, 2, "c")};
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &a3, 1)); // rolls, sealing {g1:1, g2:1}
+    try testing.expect(wal.sealed.items.len >= 1);
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try sealedSegmentPath(&pbuf, h.path, 1);
+
+    // Compacting only g1 leaves g2's entry live in segment 1 → kept.
+    try g1.compact(1);
+    try std.fs.cwd().access(p, .{});
+
+    // Now g2 is compacted too → segment 1 has no live entries → deleted.
+    try g2.compact(1);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(p, .{}));
+}
+
+test "segment recovery: full log + hard state survive across segments and GC" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 60);
+        defer wal.deinit();
+        const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g.deinit();
+
+        const hs: c.RaftHardStateFfi = .{ .term = 7, .vote = 1, .commit = 3 };
+        try testing.expectEqual(@as(i32, 0), setHardStateCb(g, &hs));
+        var b = [_]c.RaftEntryFfi{ fakeEntry(7, 1, "a"), fakeEntry(7, 2, "b"), fakeEntry(7, 3, "c"), fakeEntry(7, 4, "d") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+
+        // Compact through 3. Every sealed segment holding only entries ≤ 3
+        // is GC'd — including the one that first recorded the hard state.
+        // It survives only because each new segment's header re-baselined
+        // it (and the compaction marker).
+        try g.compact(3);
+        try wal.flush();
+    }
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+
+    // The compacted prefix is gone — recovery anchors the sentinel at the
+    // compaction point (index 3, term 7) and replays only entry 4. No gap.
+    try testing.expectEqual(@as(u64, 4), g.mem.firstIndex());
+    try testing.expectEqual(@as(u64, 4), g.mem.lastIndex());
+    try testing.expectEqual(@as(?u64, 7), g.mem.termAt(3)); // sentinel term
+    try testing.expectEqual(@as(?u64, 7), g.mem.termAt(4));
+    // Hard state recovered though its original segment was deleted.
+    try testing.expectEqual(@as(u64, 7), g.mem.hs_term);
+    try testing.expectEqual(@as(u64, 3), g.mem.hs_commit);
+}
+
+test "segment GC: noteGroupDestroyed reclaims a detached group's sealed segments" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 50);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+
+    var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c") };
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+    try testing.expect(wal.sealed.items.len >= 1);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try sealedSegmentPath(&pbuf, h.path, 1);
+    try std.fs.cwd().access(p, .{}); // sealed segment exists
+
+    // An intentional migration detach: the group's records are dead at
+    // once (no compaction needed), so its sealed segments are reclaimed.
+    wal.noteGroupDestroyed(1);
+    try testing.expectEqual(@as(usize, 0), wal.sealed.items.len);
+    try testing.expectError(error.FileNotFound, std.fs.cwd().access(p, .{}));
 }
