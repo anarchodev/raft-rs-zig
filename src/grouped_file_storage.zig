@@ -419,6 +419,11 @@ pub const GroupedFileStorage = struct {
     /// alias. The `SharedWal.appendRecord` call itself is still
     /// serialized by the dispatcher today.
     scratch: std.ArrayList(u8),
+    /// This group's compaction watermark: the highest index whose log
+    /// entry has been dropped (== `mem`'s sentinel index). Records at or
+    /// below it are dead on disk; segment GC uses this to decide when a
+    /// whole segment can be reclaimed. 0 until the first `compact`.
+    compaction_index: u64 = 0,
 
     /// Recovery counterpart to `init`: build the group, then replay the
     /// records `SharedWal.open` bucketed for it (drained from the WAL,
@@ -517,6 +522,28 @@ pub const GroupedFileStorage = struct {
         self.entry_offsets.deinit(self.allocator);
         self.scratch.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Compact this group's log through `index`: advance the in-memory
+    /// log (raising `first_index`) and drop the matching `entry_offsets`
+    /// slots in lockstep, then record the watermark. The shared WAL file
+    /// is NOT rewritten here — those on-disk records simply become dead;
+    /// segment GC reclaims the bytes once an entire segment has fallen
+    /// below every group's `compaction_index`. No-op below the current
+    /// watermark. Caller contract (raft's): only compact up to the
+    /// applied index.
+    pub fn compact(self: *GroupedFileStorage, index: u64) !void {
+        const dummy_idx = self.mem.entries.items[0].index;
+        if (index <= dummy_idx) return; // already compacted past here
+        // mem.compact validates the upper bound and advances the sentinel.
+        try self.mem.compact(index);
+        // entry_offsets tracks mem.entries 1:1; mirror the same drop so
+        // a later tail-truncate still maps indices correctly.
+        const offset: usize = @intCast(index - dummy_idx);
+        std.mem.copyForwards(u64, self.entry_offsets.items[0..], self.entry_offsets.items[offset..]);
+        self.entry_offsets.shrinkRetainingCapacity(self.entry_offsets.items.len - offset);
+        self.entry_offsets.items[0] = 0; // sentinel slot carries no record
+        self.compaction_index = index;
     }
 
     fn writeEntryRecord(self: *GroupedFileStorage, e: c.RaftEntryFfi) !u64 {
@@ -1070,4 +1097,26 @@ test "recovery: replay reproduces last-authoritative entry after a tail rewrite"
     // record is 13 + 30 + 4 = 47 bytes, so the rewrite sits at 3*47=141.
     try testing.expectEqual(@as(usize, 3), g1.entry_offsets.items.len);
     try testing.expectEqual(@as(u64, 141), g1.entry_offsets.items[2]);
+}
+
+test "GroupedFileStorage.compact: drops offset slots in lockstep with mem, advances watermark" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const wal = try SharedWal.init(testing.allocator, h.path);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+
+    var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c") };
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+    try testing.expectEqual(@as(usize, 4), g.entry_offsets.items.len); // sentinel + 3
+
+    try g.compact(2);
+    try testing.expectEqual(@as(u64, 2), g.compaction_index);
+    try testing.expectEqual(@as(u64, 3), g.mem.firstIndex());
+    // Offset map shrank in lockstep: sentinel + the one surviving entry,
+    // whose slot still points at index 3's record (2 * 47 = 94).
+    try testing.expectEqual(@as(usize, 2), g.entry_offsets.items.len);
+    try testing.expectEqual(@as(u64, 0), g.entry_offsets.items[0]);
+    try testing.expectEqual(@as(u64, 94), g.entry_offsets.items[1]);
 }

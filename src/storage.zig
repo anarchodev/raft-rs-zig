@@ -81,6 +81,47 @@ pub const MemStorage = struct {
         return self.entries.items[@intCast(offset)].term;
     }
 
+    /// Compact the log through `compact_index`: drop entries with index
+    /// <= `compact_index` and advance the snapshot sentinel to that
+    /// index (preserving its term). `first_index` becomes
+    /// `compact_index + 1`. The application calls this after it has
+    /// durably materialized state through `compact_index` (so those
+    /// entries are no longer needed to recover) — i.e. only ever up to
+    /// the applied index, which is raft's contract for compaction.
+    ///
+    /// No-op if already compacted at/after `compact_index`; errors if
+    /// `compact_index` is past the last entry (can't compact a
+    /// not-yet-present suffix).
+    pub fn compact(self: *MemStorage, compact_index: u64) !void {
+        const dummy_idx = self.entries.items[0].index;
+        if (compact_index <= dummy_idx) return; // already compacted past here
+        if (compact_index > self.lastIndex()) return error.CompactIndexOutOfBounds;
+
+        const offset: usize = @intCast(compact_index - dummy_idx);
+        // Free the data of everything dropped, including the entry that
+        // is about to become the (data-less) sentinel. Kept entries
+        // live at offset+1.. — their data is untouched.
+        for (self.entries.items[0 .. offset + 1]) |e| {
+            if (e.data.len > 0) self.allocator.free(e.data);
+            if (e.context.len > 0) self.allocator.free(e.context);
+        }
+        const term_keep = self.entries.items[offset].term;
+        self.entries.items[offset] = .{
+            .entry_type = 0,
+            .term = term_keep,
+            .index = compact_index,
+            .data = &.{},
+            .context = &.{},
+            .sync_log = false,
+        };
+        // Shift the new sentinel + kept tail down to the front. Stale
+        // duplicate structs left beyond the new length share data
+        // pointers with the kept entries, but `deinit` only walks
+        // `items[0..len]`, so each buffer is freed exactly once.
+        std.mem.copyForwards(StoredEntry, self.entries.items[0..], self.entries.items[offset..]);
+        self.entries.shrinkRetainingCapacity(self.entries.items.len - offset);
+    }
+
     fn appendOne(self: *MemStorage, e: c.RaftEntryFfi) !void {
         const last_idx = self.lastIndex();
         if (e.index <= last_idx) {
@@ -151,7 +192,10 @@ fn entriesCb(
 ) callconv(.c) i32 {
     _ = max_size;
     const self: *MemStorage = @ptrCast(@alignCast(ud.?));
-    if (low < self.firstIndex()) return -1;
+    // -2 = Compacted (asked below first_index → entries are gone, raft
+    // should fall back to a snapshot); -1 = Unavailable (asked past the
+    // tail → not yet present). raft-rs treats these very differently.
+    if (low < self.firstIndex()) return -2;
     if (high > self.lastIndex() + 1) return -1;
 
     self.entries_buf.clearRetainingCapacity();
@@ -180,6 +224,10 @@ fn entriesCb(
 
 fn termCb(ud: ?*anyopaque, idx: u64, out: [*c]u64) callconv(.c) i32 {
     const self: *MemStorage = @ptrCast(@alignCast(ud.?));
+    // Below the sentinel index the term is gone to compaction (-2);
+    // term(sentinel_idx) itself is still valid (the snapshot's term).
+    // Above the last index it's simply not present yet (-1).
+    if (idx < self.entries.items[0].index) return -2;
     if (self.termAt(idx)) |t| {
         out.* = t;
         return 0;
@@ -264,3 +312,73 @@ pub const vtable: c.RaftStorageVTable = .{
     .apply_snapshot = applySnapshotCb,
     .destroy = destroyCb,
 };
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn te(term: u64, index: u64, data: []const u8) c.RaftEntryFfi {
+    return .{
+        .entry_type = 0,
+        .term = term,
+        .index = index,
+        .data = if (data.len == 0) null else data.ptr,
+        .data_len = data.len,
+        .context = null,
+        .context_len = 0,
+        .sync_log = false,
+    };
+}
+
+test "MemStorage.compact: advances first_index, keeps sentinel term + later entries" {
+    const s = try MemStorage.init(testing.allocator, &.{1});
+    defer s.deinit();
+    try s.appendOne(te(1, 1, "a"));
+    try s.appendOne(te(1, 2, "b"));
+    try s.appendOne(te(2, 3, "c"));
+    try testing.expectEqual(@as(u64, 1), s.firstIndex());
+    try testing.expectEqual(@as(u64, 3), s.lastIndex());
+
+    try s.compact(2);
+    try testing.expectEqual(@as(u64, 3), s.firstIndex()); // compact_index + 1
+    try testing.expectEqual(@as(u64, 3), s.lastIndex());
+    // The sentinel sits at index 2 carrying entry 2's term; entry 3 stays.
+    try testing.expectEqual(@as(?u64, 1), s.termAt(2));
+    try testing.expectEqual(@as(?u64, 2), s.termAt(3));
+    // Entry 1 is gone.
+    try testing.expectEqual(@as(?u64, null), s.termAt(1));
+}
+
+test "MemStorage.compact: no-op below the watermark, error past the log" {
+    const s = try MemStorage.init(testing.allocator, &.{1});
+    defer s.deinit();
+    try s.appendOne(te(1, 1, "a"));
+    try s.appendOne(te(1, 2, "b"));
+
+    try s.compact(2);
+    try s.compact(1); // below current sentinel → no-op
+    try s.compact(2); // at current sentinel → no-op
+    try testing.expectEqual(@as(u64, 3), s.firstIndex());
+
+    try testing.expectError(error.CompactIndexOutOfBounds, s.compact(5));
+}
+
+test "MemStorage: term/entries callbacks report Compacted (-2) vs Unavailable (-1)" {
+    const s = try MemStorage.init(testing.allocator, &.{1});
+    defer s.deinit();
+    try s.appendOne(te(1, 1, "a"));
+    try s.appendOne(te(1, 2, "b"));
+    try s.appendOne(te(1, 3, "c"));
+    try s.compact(2);
+
+    var t: u64 = 0;
+    try testing.expectEqual(@as(i32, -2), termCb(s, 1, &t)); // compacted away
+    try testing.expectEqual(@as(i32, 0), termCb(s, 2, &t)); // sentinel term survives
+    try testing.expectEqual(@as(i32, -1), termCb(s, 9, &t)); // past the tail
+
+    var out: c.RaftEntriesOut = undefined;
+    const max = std.math.maxInt(u64);
+    try testing.expectEqual(@as(i32, -2), entriesCb(s, 1, 4, max, &out)); // low compacted
+    try testing.expectEqual(@as(i32, -1), entriesCb(s, 3, 9, max, &out)); // high past tail
+    try testing.expectEqual(@as(i32, 0), entriesCb(s, 3, 4, max, &out)); // valid window
+}

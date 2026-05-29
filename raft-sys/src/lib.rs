@@ -113,6 +113,18 @@ fn store_unavailable() -> raft::Error {
     raft::Error::Store(raft::StorageError::Unavailable)
 }
 
+/// Map a storage callback's return code to a raft error. rc -2 means
+/// the requested index/range is below first_index — the entries were
+/// compacted away, so raft must fall back to a snapshot (Compacted is a
+/// very different signal from Unavailable, which means "not yet here").
+fn store_err_from_rc(rc: i32) -> raft::Error {
+    if rc == -2 {
+        raft::Error::Store(raft::StorageError::Compacted)
+    } else {
+        store_unavailable()
+    }
+}
+
 fn snap_unavailable() -> raft::Error {
     raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)
 }
@@ -189,7 +201,7 @@ impl Storage for FfiStorage {
         };
         let rc = unsafe { cb(self.userdata, low, high, max, &mut out) };
         if rc != 0 {
-            return Err(store_unavailable());
+            return Err(store_err_from_rc(rc));
         }
         let entries: Vec<Entry> = if out.len > 0 && !out.entries.is_null() {
             let descriptors = unsafe { slice::from_raw_parts(out.entries, out.len) };
@@ -237,7 +249,7 @@ impl Storage for FfiStorage {
         let mut out = 0u64;
         let rc = unsafe { cb(self.userdata, idx, &mut out) };
         if rc != 0 {
-            return Err(store_unavailable());
+            return Err(store_err_from_rc(rc));
         }
         Ok(out)
     }
