@@ -32,18 +32,37 @@
 //! dispatcher calls it once per pump cycle after every ready group has
 //! run processReady. No per-group flush is exposed by the vtable.
 //!
-//! v1 scope (benchmark-correct only, same caveat as `FileStorage` v1):
-//!   - WAL is truncated on init; there is no replay-from-existing path.
-//!   - **Tail-truncate** (leader-change conflict where raft-rs rewrites
-//!     the uncommitted suffix of a group's log) updates that group's
-//!     in-memory `MemStorage` view + its `entry_offsets` map, but does
-//!     NOT physically rewind the shared file — other groups have
-//!     appended past the truncated region, so a `setEndPos` would
-//!     orphan their entries. The bytes between a truncated entry's
-//!     start and the file's current end are dead-but-present. Replay
-//!     (when implemented) must walk the file, dispatch records by
-//!     `group_id`, and apply per-group last-authoritative-entry
-//!     semantics.
+//! ## Recovery (replay-from-existing)
+//!
+//! `SharedWal.open` is the crash-recovery constructor (vs `init`, which
+//! truncates fresh). It walks the existing file once, CRC-validates each
+//! record, and **stops at the first torn or corrupt record** — a
+//! half-written tail from a crash mid-append. Everything up to that
+//! point is the durable prefix; the torn tail is physically truncated
+//! and the write head positioned at the prefix end so the next append
+//! continues cleanly.
+//!
+//! While scanning it buckets the recovered records by `group_id`, in
+//! file order. `GroupedFileStorage.initRecover` then drains its group's
+//! bucket and replays the records through the same append path a live
+//! group uses. That is what makes **tail-truncate** correct on replay:
+//! a leader-change rewrite of an uncommitted suffix was *appended* to
+//! the shared file (it could not physically rewind — other groups had
+//! appended past the rewritten region, so a `setEndPos` would orphan
+//! their entries). Replaying records in file order feeds the rewrite
+//! through `MemStorage.appendOne`'s "index <= last ⇒ truncate then
+//! append" rule, so the later record supersedes the earlier one at the
+//! same index — last-authoritative-entry per group falls out for free,
+//! and the rebuilt `entry_offsets` point at the surviving records.
+//!
+//! Out of scope for this slice (separate work, noted so nobody assumes
+//! it's done): **segment GC** and a **per-group compaction watermark**.
+//! Those need the log to be *segmented* (it is one file today) and to
+//! persist snapshots (snapshot bytes are not WAL-backed yet), so they
+//! are a distinct piece, not part of recovery. Until then the full log
+//! is always present, so replay reconstructs the complete entry stream
+//! plus the latest hard state — which is exactly correct for a log that
+//! never compacts.
 
 const std = @import("std");
 const c = @cImport({
@@ -64,6 +83,26 @@ const HEADER_LEN: usize = 1 + 8 + 4;
 /// Length of the per-record trailer: crc32.
 const TRAILER_LEN: usize = 4;
 
+/// Upper bound on a single record's payload during recovery. A length
+/// field larger than this is treated as corruption (torn tail), not a
+/// real record — it bounds recovery memory against a garbage length
+/// read from a half-written header. Generous vs any real raft entry.
+const MAX_REPLAY_PAYLOAD: u32 = 64 * 1024 * 1024;
+
+/// One record recovered from the WAL during `SharedWal.open`, awaiting
+/// replay into its group's storage. Owns its payload copy (the scan
+/// buffer is reused); freed when the group drains its bucket in
+/// `initRecover`, or by `SharedWal.deinit` for any group that never
+/// re-created (an orphaned bucket).
+pub const RecoveredRecord = struct {
+    tag: Tag,
+    /// Byte offset of this record's start in the file — becomes the
+    /// group's `entry_offsets` slot for entry records.
+    offset: u64,
+    /// Owned copy of the record payload (body only, no header/trailer).
+    payload: []u8,
+};
+
 /// One shared WAL file across all groups on a single cluster-node.
 /// Construction + flush are the dispatcher's responsibility; group
 /// storages borrow `*SharedWal` via `GroupedFileStorage.init` and
@@ -82,7 +121,16 @@ pub const SharedWal = struct {
     /// Monotonic write head — used to record per-group entry offsets
     /// before each append so the per-group map stays in lockstep.
     wal_offset: u64,
+    /// Records recovered by `open`, bucketed by `group_id` in file
+    /// order, awaiting replay. Empty after `init` (fresh start). Each
+    /// group drains its bucket in `GroupedFileStorage.initRecover`;
+    /// `deinit` frees any bucket that was never drained.
+    recovered: std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
 
+    /// Fresh start: truncate any existing file to empty. Use `open`
+    /// instead to recover an existing WAL across a restart. (Tests,
+    /// benchmarks, and any caller that genuinely wants a clean slate
+    /// use this; production boot uses `open`.)
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) !*SharedWal {
         const self = try allocator.create(SharedWal);
         errdefer allocator.destroy(self);
@@ -90,9 +138,6 @@ pub const SharedWal = struct {
         const path_dup = try allocator.dupe(u8, wal_path);
         errdefer allocator.free(path_dup);
 
-        // v1: always start fresh. Same caveat as `FileStorage` v1 —
-        // the truncate is what makes this "benchmark-correct only";
-        // a restart-correct version replays the existing file.
         const file = try std.fs.cwd().createFile(wal_path, .{
             .truncate = true,
             .read = false,
@@ -104,6 +149,50 @@ pub const SharedWal = struct {
             .file = file,
             .wal_path = path_dup,
             .wal_offset = 0,
+            .recovered = std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)).init(allocator),
+        };
+        return self;
+    }
+
+    /// Crash-recovery start: open an existing WAL (or create it if
+    /// absent), replay-scan it, truncate any torn tail, and position
+    /// the write head at the durable prefix end. Recovered records are
+    /// bucketed by group in `self.recovered`; callers re-create each
+    /// group via `GroupedFileStorage.initRecover`, which drains the
+    /// matching bucket. See the module doc comment for the recovery
+    /// model and what it deliberately does not yet cover.
+    pub fn open(allocator: std.mem.Allocator, wal_path: []const u8) !*SharedWal {
+        const self = try allocator.create(SharedWal);
+        errdefer allocator.destroy(self);
+
+        const path_dup = try allocator.dupe(u8, wal_path);
+        errdefer allocator.free(path_dup);
+
+        // truncate=false → preserve existing bytes; read=true → allow
+        // the positional reads the scan needs. Creates an empty file on
+        // first boot.
+        const file = try std.fs.cwd().createFile(wal_path, .{
+            .truncate = false,
+            .read = true,
+        });
+        errdefer file.close();
+
+        var recovered = std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)).init(allocator);
+        errdefer freeRecovered(allocator, &recovered);
+
+        const valid_end = try scanForReplay(allocator, file, &recovered);
+
+        // Drop the torn tail (if any) and position the write head at the
+        // durable prefix end so the next `appendRecord` continues cleanly.
+        try file.setEndPos(valid_end);
+        try file.seekTo(valid_end);
+
+        self.* = .{
+            .allocator = allocator,
+            .file = file,
+            .wal_path = path_dup,
+            .wal_offset = valid_end,
+            .recovered = recovered,
         };
         return self;
     }
@@ -111,8 +200,18 @@ pub const SharedWal = struct {
     pub fn deinit(self: *SharedWal) void {
         self.file.close();
         const a = self.allocator;
+        freeRecovered(a, &self.recovered);
         a.free(self.wal_path);
         a.destroy(self);
+    }
+
+    /// Hand a group its recovered records (ownership transfers to the
+    /// caller, which must free each `payload` and `deinit` the list).
+    /// Removes the bucket from `recovered` so `deinit` won't double-free
+    /// it. Returns null for a group with nothing to replay.
+    pub fn takeRecovered(self: *SharedWal, group_id: u64) ?std.ArrayList(RecoveredRecord) {
+        if (self.recovered.fetchRemove(group_id)) |kv| return kv.value;
+        return null;
     }
 
     /// fsync the WAL. The dispatcher calls this ONCE per pump cycle
@@ -160,6 +259,135 @@ pub const SharedWal = struct {
     }
 };
 
+/// Free every recovered bucket and the map itself. Used both by
+/// `SharedWal.deinit` (for buckets no group claimed) and by `open`'s
+/// errdefer if recovery fails partway.
+fn freeRecovered(
+    allocator: std.mem.Allocator,
+    recovered: *std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
+) void {
+    var it = recovered.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |r| allocator.free(r.payload);
+        entry.value_ptr.deinit(allocator);
+    }
+    recovered.deinit();
+}
+
+/// pread `buf.len` bytes at `offset`, looping over short reads. Returns
+/// the count actually read — less than `buf.len` only at end-of-file
+/// (a torn tail), which the caller reads as the recovery boundary.
+fn readFull(file: std.fs.File, buf: []u8, offset: u64) !usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = try file.pread(buf[total..], offset + @as(u64, total));
+        if (n == 0) break;
+        total += n;
+    }
+    return total;
+}
+
+/// Walk the WAL from offset 0, CRC-validating each record and bucketing
+/// the valid ones by `group_id` (in file order) into `recovered`.
+/// Stops at the first record that is short-read or fails its CRC — that
+/// is the crash boundary; everything before it is the durable prefix.
+/// Returns the byte offset of that boundary (the durable prefix length).
+fn scanForReplay(
+    allocator: std.mem.Allocator,
+    file: std.fs.File,
+    recovered: *std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
+) !u64 {
+    var off: u64 = 0;
+    var header: [HEADER_LEN]u8 = undefined;
+    var trailer: [TRAILER_LEN]u8 = undefined;
+    while (true) {
+        const hn = try readFull(file, &header, off);
+        if (hn < HEADER_LEN) break; // clean EOF (hn==0) or torn header
+
+        const tag: Tag = switch (header[0]) {
+            1 => .entry,
+            2 => .hardstate,
+            3 => .confstate,
+            else => break, // unknown tag — garbage from a torn write
+        };
+        const group_id = std.mem.readInt(u64, header[1..9], .little);
+        const payload_len = std.mem.readInt(u32, header[9..13], .little);
+        if (payload_len > MAX_REPLAY_PAYLOAD) break; // garbage length → torn
+
+        const payload = try allocator.alloc(u8, payload_len);
+        var keep_payload = false;
+        defer if (!keep_payload) allocator.free(payload);
+
+        const pn = try readFull(file, payload, off + HEADER_LEN);
+        if (pn < payload_len) break; // torn payload
+        const tn = try readFull(file, &trailer, off + HEADER_LEN + payload_len);
+        if (tn < TRAILER_LEN) break; // torn trailer
+
+        var crc = std.hash.Crc32.init();
+        crc.update(header[0..]);
+        crc.update(payload);
+        if (crc.final() != std.mem.readInt(u32, trailer[0..], .little)) break; // corrupt
+
+        const gop = try recovered.getOrPut(group_id);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(allocator, .{ .tag = tag, .offset = off, .payload = payload });
+        keep_payload = true; // ownership moved into the bucket
+
+        off += HEADER_LEN + payload_len + TRAILER_LEN;
+    }
+    return off;
+}
+
+/// Decode an `entry`-record payload (written by `writeEntryRecord`)
+/// back into a `RaftEntryFfi`. The returned `data`/`context` pointers
+/// borrow `payload` — valid only while `payload` lives (the caller's
+/// `MemStorage` append copies them). Bounds are checked at every step;
+/// a malformed payload (shouldn't happen post-CRC, but defensive)
+/// returns an error rather than reading out of bounds.
+fn parseEntryPayload(payload: []const u8) !c.RaftEntryFfi {
+    if (payload.len < 4 + 8 + 8 + 4) return error.TruncatedEntryRecord;
+    const entry_type = std.mem.readInt(u32, payload[0..4], .little);
+    const term = std.mem.readInt(u64, payload[4..12], .little);
+    const index = std.mem.readInt(u64, payload[12..20], .little);
+    const data_len: usize = std.mem.readInt(u32, payload[20..24], .little);
+
+    var p: usize = 24;
+    if (p + data_len > payload.len) return error.TruncatedEntryRecord;
+    const data = payload[p .. p + data_len];
+    p += data_len;
+
+    if (p + 4 > payload.len) return error.TruncatedEntryRecord;
+    const context_len: usize = std.mem.readInt(u32, payload[p..][0..4], .little);
+    p += 4;
+    if (p + context_len > payload.len) return error.TruncatedEntryRecord;
+    const context = payload[p .. p + context_len];
+    p += context_len;
+
+    if (p + 1 > payload.len) return error.TruncatedEntryRecord;
+    const sync_log = payload[p] != 0;
+
+    return .{
+        .entry_type = entry_type,
+        .term = term,
+        .index = index,
+        .data = if (data_len > 0) data.ptr else null,
+        .data_len = data_len,
+        .context = if (context_len > 0) context.ptr else null,
+        .context_len = context_len,
+        .sync_log = sync_log,
+    };
+}
+
+/// Decode a `hardstate`-record payload (24 bytes: term, vote, commit).
+fn parseHardStatePayload(payload: []const u8) !c.RaftHardStateFfi {
+    if (payload.len < 24) return error.TruncatedHardStateRecord;
+    return .{
+        .term = std.mem.readInt(u64, payload[0..8], .little),
+        .vote = std.mem.readInt(u64, payload[8..16], .little),
+        .commit = std.mem.readInt(u64, payload[16..24], .little),
+    };
+}
+
 /// Per-group storage on top of `SharedWal`. raft-rs sees this through
 /// the `vtable` below; `*GroupedFileStorage` is the userdata pointer
 /// passed to `Manager.createGroup`. Each group has its own
@@ -191,6 +419,67 @@ pub const GroupedFileStorage = struct {
     /// alias. The `SharedWal.appendRecord` call itself is still
     /// serialized by the dispatcher today.
     scratch: std.ArrayList(u8),
+
+    /// Recovery counterpart to `init`: build the group, then replay the
+    /// records `SharedWal.open` bucketed for it (drained from the WAL,
+    /// applied in file order). After this returns, `mem` and
+    /// `entry_offsets` reflect the durable on-disk state — same as if
+    /// the group had been live when those records were first written.
+    /// A group with nothing recovered comes back empty, exactly like
+    /// `init`. The WAL must have been created with `open`, not `init`.
+    pub fn initRecover(
+        allocator: std.mem.Allocator,
+        voters: []const u64,
+        wal: *SharedWal,
+        group_id: u64,
+    ) !*GroupedFileStorage {
+        const self = try GroupedFileStorage.init(allocator, voters, wal, group_id);
+        errdefer self.deinit();
+
+        if (wal.takeRecovered(group_id)) |taken| {
+            var bucket = taken;
+            defer {
+                for (bucket.items) |r| allocator.free(r.payload);
+                bucket.deinit(allocator);
+            }
+            for (bucket.items) |r| switch (r.tag) {
+                .entry => try self.replayEntry(try parseEntryPayload(r.payload), r.offset),
+                .hardstate => self.replayHardState(try parseHardStatePayload(r.payload)),
+                .confstate => {}, // not produced today — skip, bytes already accounted
+            };
+        }
+        return self;
+    }
+
+    /// Replay one recovered entry: mirror `appendEntriesCb`'s
+    /// tail-truncate-then-append on `entry_offsets` (using the entry's
+    /// real on-disk `file_offset`, not a fresh write), then feed it
+    /// through `MemStorage`'s append — whose own "index <= last ⇒
+    /// truncate" rule makes a later-in-file rewrite supersede an earlier
+    /// record at the same index. No bytes are written to the WAL.
+    fn replayEntry(self: *GroupedFileStorage, e: c.RaftEntryFfi, file_offset: u64) !void {
+        const last_idx = self.mem.lastIndex();
+        if (e.index <= last_idx) {
+            const sentinel_idx = self.mem.entries.items[0].index;
+            if (e.index <= sentinel_idx) return error.ReplayIndexBeforeSnapshot;
+            const truncate_at: usize = @intCast(e.index - sentinel_idx);
+            self.entry_offsets.shrinkRetainingCapacity(truncate_at);
+        }
+        try self.entry_offsets.append(self.allocator, file_offset);
+        var arr = [_]c.RaftEntryFfi{e};
+        // @ptrCast: the MemStorage vtable's RaftEntryFfi comes from
+        // storage.zig's own @cImport, a distinct type from ours (same
+        // dance as `appendEntriesCb`).
+        if (mem_storage.vtable.append_entries.?(self.mem, @ptrCast(&arr), 1) != 0)
+            return error.ReplayAppendFailed;
+    }
+
+    /// Replay one recovered hard state into `mem` (no WAL write). Later
+    /// records overwrite earlier ones, so file order yields the last
+    /// durable hard state.
+    fn replayHardState(self: *GroupedFileStorage, hs: c.RaftHardStateFfi) void {
+        _ = mem_storage.vtable.set_hard_state.?(self.mem, @ptrCast(&hs));
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -628,4 +917,157 @@ test "SharedWal.flush: a single flush amortizes K groups' writes" {
     // + 4 trailer = 50 bytes (33 = 4 entry_type + 8 term + 8 index + 4
     // data_len + 4 data + 4 context_len + 1 sync_log).
     try testing.expectEqual(@as(u64, K * 50), wal.wal_offset);
+}
+
+test "recovery: open on a fresh path yields an empty WAL" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    try testing.expectEqual(@as(u64, 0), wal.wal_offset);
+    try testing.expectEqual(@as(usize, 0), wal.recovered.count());
+
+    // initRecover on a group with nothing on disk is just an empty group.
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    try testing.expectEqual(@as(u64, 0), g1.mem.lastIndex());
+}
+
+test "recovery: open rebuilds per-group log + hardstate from a written WAL" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    // Write phase: two groups interleaved, entries + a hardstate, flush.
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+        const g2 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 2);
+        defer g2.deinit();
+
+        var b1 = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "bb") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b1, b1.len));
+        const hs1: c.RaftHardStateFfi = .{ .term = 1, .vote = 1, .commit = 2 };
+        try testing.expectEqual(@as(i32, 0), setHardStateCb(g1, &hs1));
+
+        var b2 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "z")};
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g2, &b2, 1));
+
+        try wal.flush();
+    }
+
+    // Recover phase: a fresh process re-opens the same file.
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    const g2 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 2);
+    defer g2.deinit();
+
+    // g1: both entries + the hardstate came back.
+    try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+    try testing.expectEqual(@as(u64, 1), g1.mem.hs_term);
+    try testing.expectEqual(@as(u64, 2), g1.mem.hs_commit);
+    // g2: its single independent entry.
+    try testing.expectEqual(@as(u64, 1), g2.mem.lastIndex());
+
+    // entry_offsets rebuilt (sentinel + N), and g1's first entry is the
+    // first record in the file.
+    try testing.expectEqual(@as(usize, 3), g1.entry_offsets.items.len);
+    try testing.expectEqual(@as(usize, 2), g2.entry_offsets.items.len);
+    try testing.expectEqual(@as(u64, 0), g1.entry_offsets.items[1]);
+
+    // Write head sits at the durable prefix end (== file size), so the
+    // next append continues the file rather than overwriting it.
+    try testing.expectEqual((try wal.file.stat()).size, wal.wal_offset);
+    var b3 = [_]c.RaftEntryFfi{fakeEntry(1, 3, "c")};
+    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b3, 1));
+    try testing.expectEqual(@as(u64, 3), g1.mem.lastIndex());
+}
+
+test "recovery: a torn (CRC-failed) tail record is dropped and truncated" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    var valid_size: u64 = 0;
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+        var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b, b.len));
+        try wal.flush();
+        valid_size = wal.wal_offset;
+    }
+
+    // Simulate a crash mid-append: a structurally complete record with a
+    // wrong CRC tacked onto the end (exercises header+payload+trailer
+    // read, then the CRC-mismatch boundary).
+    {
+        var rec: [HEADER_LEN + 3 + TRAILER_LEN]u8 = undefined;
+        rec[0] = @intFromEnum(Tag.entry);
+        std.mem.writeInt(u64, rec[1..9], 1, .little);
+        std.mem.writeInt(u32, rec[9..13], 3, .little);
+        @memcpy(rec[13..16], "xxx");
+        std.mem.writeInt(u32, rec[16..20], 0xDEADBEEF, .little); // not the real CRC
+        const f = try std.fs.cwd().openFile(h.path, .{ .mode = .write_only });
+        defer f.close();
+        try f.seekTo(valid_size);
+        try f.writeAll(&rec);
+    }
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+
+    // Only the durable prefix recovered; the torn record is gone.
+    try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+    // Torn tail physically truncated.
+    try testing.expectEqual(valid_size, wal.wal_offset);
+    try testing.expectEqual(valid_size, (try wal.file.stat()).size);
+}
+
+test "recovery: replay reproduces last-authoritative entry after a tail rewrite" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+
+        // idx 1,2,3 at term 1.
+        var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b, b.len));
+        // Leader change rewrites idx 2 at term 2 — appended to the file
+        // (can't physically rewind a shared WAL), truncating 2,3 in the
+        // live view.
+        var rw = [_]c.RaftEntryFfi{fakeEntry(2, 2, "B")};
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &rw, 1));
+        try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+        try wal.flush();
+    }
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+
+    // Replaying the four records in file order reproduces the live view:
+    // the later idx-2 record supersedes the earlier one, and idx 3 is gone.
+    try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+    try testing.expectEqual(@as(?u64, 1), g1.mem.termAt(1));
+    try testing.expectEqual(@as(?u64, 2), g1.mem.termAt(2));
+    try testing.expectEqual(@as(?u64, null), g1.mem.termAt(3));
+
+    // entry_offsets: sentinel + idx1 + idx2(rewrite). The idx-2 slot
+    // points at the 4th (rewrite) record. Each single-byte-data entry
+    // record is 13 + 30 + 4 = 47 bytes, so the rewrite sits at 3*47=141.
+    try testing.expectEqual(@as(usize, 3), g1.entry_offsets.items.len);
+    try testing.expectEqual(@as(u64, 141), g1.entry_offsets.items[2]);
 }
