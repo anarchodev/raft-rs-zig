@@ -69,6 +69,11 @@ pub const Error = error{
     TakeMessagesFailed,
     StepFailed,
     StepDecodeFailed,
+    /// `stepFenced` dropped the message: its sender epoch was older
+    /// than the group's current incarnation (migration fence).
+    StepFenced,
+    /// `setEpoch` rejected a request to lower a group's epoch.
+    EpochRegression,
     UnknownGroup,
 };
 
@@ -106,12 +111,51 @@ pub const Manager = struct {
         vtable: *const c.RaftStorageVTable,
         storage_userdata: *anyopaque,
     ) Error!void {
+        // Birth epoch 0 — the never-migrated case. A group that is
+        // being attached as part of a migration uses
+        // `createGroupEpoch` so the fence is live from creation.
+        return self.createGroupEpoch(group_id, node_id, 0, vtable, storage_userdata);
+    }
+
+    /// `createGroup` with an explicit migration fence epoch (see
+    /// `stepFenced`). The control plane passes the epoch it assigned
+    /// to this move so inbound messages from the group's previous
+    /// incarnation are fenced out from the instant the group exists.
+    pub fn createGroupEpoch(
+        self: *Manager,
+        group_id: u64,
+        node_id: u64,
+        epoch: u64,
+        vtable: *const c.RaftStorageVTable,
+        storage_userdata: *anyopaque,
+    ) Error!void {
         // `node_id` is this node's identity within the group's
         // voter set — must match one of the `voters` the storage
         // returns from `initial_state`. Single-node tests/demos
         // always pass 1; multi-node uses 1..=cluster_size.
-        const rc = c.raft_manager_create_group(self.ptr, group_id, node_id, vtable, storage_userdata);
+        const rc = c.raft_manager_create_group(self.ptr, group_id, node_id, epoch, vtable, storage_userdata);
         if (rc != 0) return Error.CreateGroupFailed;
+    }
+
+    /// Read a group's current migration fence epoch. The transport
+    /// stamps outbound messages with this; the peer hands it back to
+    /// `stepFenced`. Returns 0 for an unknown group (same value as a
+    /// legitimate epoch-0 group — check `hasGroup` if you must tell
+    /// them apart).
+    pub fn groupEpoch(self: *const Manager, group_id: u64) u64 {
+        return c.raft_manager_group_epoch(self.ptr, group_id);
+    }
+
+    /// Set a live group's migration fence epoch. Monotonic — lowering
+    /// it is rejected (`Error.EpochRegression`) because that would
+    /// re-admit already-fenced traffic. Birth epoch for a migration
+    /// attach belongs in `createGroupEpoch`, not here.
+    pub fn setEpoch(self: *Manager, group_id: u64, epoch: u64) Error!void {
+        return switch (c.raft_manager_set_epoch(self.ptr, group_id, epoch)) {
+            0 => {},
+            -2 => Error.EpochRegression,
+            else => Error.UnknownGroup,
+        };
     }
 
     /// Tear down the group. Storage is freed via the `destroy`
@@ -251,6 +295,29 @@ pub const Manager = struct {
         };
     }
 
+    /// `step`, fenced by the migration epoch. `sender_epoch` is the
+    /// fence epoch the producing group was stamped with (read at the
+    /// source via `groupEpoch`). If it is strictly older than this
+    /// group's current epoch the message belongs to a pre-migration
+    /// incarnation and is dropped with `Error.StepFenced` — it never
+    /// reaches raft, so its (reset) term cannot perturb the fresh
+    /// group. Non-migrated groups stamp 0 on both ends, so the fence
+    /// is a no-op there.
+    pub fn stepFenced(
+        self: *Manager,
+        group_id: u64,
+        sender_epoch: u64,
+        msg_bytes: []const u8,
+    ) Error!void {
+        const rc = c.raft_manager_step_fenced(self.ptr, group_id, sender_epoch, msg_bytes.ptr, msg_bytes.len);
+        return switch (rc) {
+            0 => {},
+            -2 => Error.StepDecodeFailed,
+            -4 => Error.StepFenced,
+            else => Error.StepFailed,
+        };
+    }
+
     /// Batch-step many inbound messages in one FFI call. Returns
     /// the count of successful steps; unknown groups, decode
     /// failures, and step-rejected messages are silently skipped
@@ -273,6 +340,13 @@ pub const Manager = struct {
 /// to the FFI with no copy.
 pub const StepBatchEntry = extern struct {
     group_id: u64,
+    /// Sender's migration fence epoch (see `stepFenced`). Defaults to
+    /// 0 — the engine's "never-migrated, fence-is-a-no-op" convention,
+    /// matching `createGroup`'s epoch-0 default — so the common
+    /// non-migrating receive path needn't spell it out. The default is
+    /// a Zig-source convenience only; it does not affect the C ABI
+    /// layout, which matches `RaftStepBatchEntry` field-for-field.
+    epoch: u64 = 0,
     msg_ptr: [*]const u8,
     msg_len: usize,
 };
@@ -311,6 +385,48 @@ const MsgCollector = struct {
         return bytes_buf[0..bytes_len];
     }
 };
+
+/// Apply callback that ignores every committed entry — for tests that
+/// only care about message flow / fencing, not state-machine output.
+fn noopApply(
+    ud: ?*anyopaque,
+    gid: u64,
+    idx: u64,
+    term: u64,
+    data: [*c]const u8,
+    len: usize,
+) callconv(.c) void {
+    _ = ud;
+    _ = gid;
+    _ = idx;
+    _ = term;
+    _ = data;
+    _ = len;
+}
+
+/// Spin up a throwaway leader (group 1, node 1, cluster {1,2}),
+/// campaign it, and capture the real `RequestVote` bytes it emits to
+/// peer node 2 into `MsgCollector`'s static buffer. Returns the
+/// captured slice — a genuine eraftpb message, valid until the next
+/// `MsgCollector.reset()`. Used by the fence tests so they exercise
+/// the decode path with a real message, not garbage.
+fn captureRealVote() ![]const u8 {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
+    try mgr.createGroup(1, 1, storage_vtable, storage);
+    try mgr.campaign(1);
+    var buf: [16]u64 = undefined;
+    mgr.tickAll();
+    const ready = mgr.pollReady(&buf);
+    try testing.expect(ready.len >= 1);
+    for (ready) |g| try mgr.processReady(g, noopApply, null);
+    MsgCollector.reset();
+    try mgr.takeMessages(1, MsgCollector.cb, null);
+    try testing.expectEqual(@as(u64, 2), MsgCollector.last_to);
+    try testing.expect(MsgCollector.snapshot().len > 0);
+    return MsgCollector.snapshot();
+}
 
 test "Manager: take_messages drains the outbox after a campaign (multi-node sanity)" {
     // Two nodes (groups 1 and 2 internally, but they're really two
@@ -367,4 +483,105 @@ test "Manager: step rejects garbage bytes with StepDecodeFailed" {
 
     const garbage = [_]u8{ 0xff, 0xff, 0xff, 0xff };
     try testing.expectError(Error.StepDecodeFailed, mgr.step(1, &garbage));
+}
+
+test "Manager: epoch defaults to 0, is readable, and unknown groups read 0" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroup(1, 1, storage_vtable, storage);
+    try testing.expectEqual(@as(u64, 0), mgr.groupEpoch(1));
+    // Unknown group reads 0 too — same value as a real epoch-0 group.
+    try testing.expectEqual(@as(u64, 0), mgr.groupEpoch(999));
+}
+
+test "Manager: createGroupEpoch records the birth epoch" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroupEpoch(1, 1, 7, storage_vtable, storage);
+    try testing.expectEqual(@as(u64, 7), mgr.groupEpoch(1));
+}
+
+test "Manager: setEpoch is monotonic — raise allowed, regression rejected" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage);
+
+    try mgr.setEpoch(1, 5); // equal is fine
+    try mgr.setEpoch(1, 8); // raise is fine
+    try testing.expectEqual(@as(u64, 8), mgr.groupEpoch(1));
+
+    // Lowering re-admits already-fenced traffic — rejected, no change.
+    try testing.expectError(Error.EpochRegression, mgr.setEpoch(1, 7));
+    try testing.expectEqual(@as(u64, 8), mgr.groupEpoch(1));
+
+    try testing.expectError(Error.UnknownGroup, mgr.setEpoch(999, 1));
+}
+
+test "Manager: stepFenced drops stale-epoch messages before decode" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage);
+
+    // Garbage bytes: a stale epoch is fenced *before* the protobuf
+    // decode runs, so we get StepFenced — not StepDecodeFailed. That
+    // ordering is the point: a flood of stale traffic costs one compare
+    // per message, never a decode.
+    const garbage = [_]u8{ 0xff, 0xff, 0xff, 0xff };
+    try testing.expectError(Error.StepFenced, mgr.stepFenced(1, 4, &garbage));
+    // At the current epoch (or newer) the fence passes and the decode
+    // runs — and rejects the garbage.
+    try testing.expectError(Error.StepDecodeFailed, mgr.stepFenced(1, 5, &garbage));
+    try testing.expectError(Error.StepDecodeFailed, mgr.stepFenced(1, 6, &garbage));
+}
+
+test "Manager: migration fence — fresh incarnation rejects old-epoch traffic, admits current" {
+    // A real RequestVote from the group's previous home (node 1).
+    const vote = try captureRealVote();
+
+    // The group has migrated: node 2 now hosts the same group id at
+    // incarnation epoch 5 (the control plane bumped the epoch for the
+    // move). This is the scenario term-based fencing can't handle — the
+    // fresh group's term reset, so the stale vote could carry a higher
+    // term and depose its leader if it weren't fenced.
+    var dst = try Manager.init();
+    defer dst.deinit();
+    const dst_storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
+    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage);
+
+    // Stamped with the previous incarnation's epoch (4) → fenced.
+    try testing.expectError(Error.StepFenced, dst.stepFenced(1, 4, vote));
+    // The same message at the current epoch is admitted.
+    try dst.stepFenced(1, 5, vote);
+}
+
+test "Manager: stepBatch fences stale-epoch entries (skipped, not stepped)" {
+    const vote = try captureRealVote();
+
+    var dst = try Manager.init();
+    defer dst.deinit();
+    const dst_storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
+    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage);
+
+    // The fence applies on the coalesced fast path too: a stale entry
+    // is skipped (not counted as a successful step).
+    var stale = [_]StepBatchEntry{.{
+        .group_id = 1,
+        .epoch = 4,
+        .msg_ptr = vote.ptr,
+        .msg_len = vote.len,
+    }};
+    try testing.expectEqual(@as(usize, 0), dst.stepBatch(&stale));
+
+    // A current-epoch entry steps successfully.
+    var current = [_]StepBatchEntry{.{
+        .group_id = 1,
+        .epoch = 5,
+        .msg_ptr = vote.ptr,
+        .msg_len = vote.len,
+    }};
+    try testing.expectEqual(@as(usize, 1), dst.stepBatch(&current));
 }

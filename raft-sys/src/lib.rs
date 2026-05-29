@@ -377,7 +377,45 @@ struct GroupSlot {
     /// Mailbox state — `NOTIFY_IDLE` / `NOTIFY_NOTIFIED` / `NOTIFY_DROP`.
     /// See the `mailbox` block-comment above.
     state: AtomicU8,
+    /// Migration fence epoch — see the `epoch / fence` block-comment
+    /// below. The group's current incarnation number. `step_fenced`
+    /// rejects any inbound message stamped with a strictly-older
+    /// epoch, so traffic addressed to a pre-migration incarnation of
+    /// this group id cannot revive or confuse the new one (raft's own
+    /// term-based fencing can't do this: terms reset across an
+    /// incarnation boundary, so a stale message can carry a higher
+    /// term than the fresh group and wrongly depose its leader).
+    epoch: u64,
 }
+
+// ── Epoch / fence ─────────────────────────────────────────────────────
+//
+// No-downtime tenant migration moves a group id from one node (one DP
+// cluster) to another by detaching committed state and re-creating the
+// group at the destination. The destination starts a *fresh* raft
+// incarnation (term/commit-idx reset — see the migration learnings doc
+// §4). That reset is exactly what makes stale in-flight messages
+// dangerous: a message from the old incarnation can carry a term
+// higher than the fresh group's, and raft would honour it (step down a
+// just-elected leader, accept a stale append). raft's term mechanism
+// fences *within* one incarnation; it cannot fence *across* one.
+//
+// The epoch is the cross-incarnation fence. It is a per-group counter
+// the control plane assigns monotonically across moves (the CP's
+// tenant registry owns allocation; the engine only stores + enforces).
+// Outbound messages are stamped with the sending group's epoch at the
+// transport layer (read via `raft_manager_group_epoch`); the receiver
+// passes that stamp to `step_fenced`, which drops anything strictly
+// older than the local epoch (TiKV's `is_epoch_stale` shape). A group
+// that never migrates stays at epoch 0 and every message stamps 0, so
+// the fence is a no-op (0 < 0 is false) and costs a single compare.
+
+/// Epoch carried by an inbound message was older than the group's
+/// current incarnation — the message is stale (addressed to a
+/// pre-migration incarnation) and was dropped. Distinct from the other
+/// `step` failure codes so the transport can tell a fence-drop apart
+/// from a decode error or an unknown group.
+const STEP_FENCED: i32 = -4;
 
 /// Multi-raft manager. Caller-serialized for the high-volume per-
 /// group ops (propose/step/process_ready/take_messages); `notify` is
@@ -440,6 +478,13 @@ pub unsafe extern "C" fn raft_manager_free(m: *mut RaftManager) {
 
 /// Create a raft group backed by a caller-supplied storage vtable.
 ///
+/// `epoch` is the group's birth incarnation number for the migration
+/// fence (see the `epoch / fence` block-comment). Fresh, never-migrated
+/// groups pass 0. A migration attach passes the control-plane-assigned
+/// epoch for this move so the fence is in force from the instant the
+/// group exists — closing the window a separate `set_epoch` after
+/// `create_group` would leave open.
+///
 /// Returns 0 on success, -1 if a group with `group_id` exists, -2 if it is
 /// tombstoned, -3 on bad input or internal raft error.
 #[no_mangle]
@@ -447,6 +492,7 @@ pub unsafe extern "C" fn raft_manager_create_group(
     m: *mut RaftManager,
     group_id: u64,
     node_id: u64,
+    epoch: u64,
     vtable: *const RaftStorageVTable,
     storage_userdata: *mut c_void,
 ) -> i32 {
@@ -478,6 +524,7 @@ pub unsafe extern "C" fn raft_manager_create_group(
                     node,
                     outbox: Vec::new(),
                     state: AtomicU8::new(NOTIFY_IDLE),
+                    epoch,
                 },
             );
             // A fresh group has no committed entries / no outbound
@@ -549,6 +596,54 @@ pub unsafe extern "C" fn raft_manager_clear_tombstone(
     let mgr = &mut *m;
     mgr.tombstones.remove(&group_id);
     0
+}
+
+/// Read a group's current fence epoch. The transport stamps each
+/// outbound message with this so the receiving `step_fenced` can drop
+/// stale (older-incarnation) traffic. Returns 0 for an unknown group —
+/// indistinguishable from a legitimate epoch-0 group, so callers that
+/// need the difference check `raft_manager_has_group` first.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_group_epoch(
+    m: *const RaftManager,
+    group_id: u64,
+) -> u64 {
+    let mgr = &*m;
+    mgr.groups.get(&group_id).map(|s| s.epoch).unwrap_or(0)
+}
+
+/// Set a group's fence epoch. The intended caller is the control
+/// plane bumping the epoch on a live group — e.g. re-fencing after a
+/// membership change, or raising it as part of a move when the group
+/// is attached in place rather than re-created. Birth-epoch for a
+/// migration attach should go through `create_group`'s `epoch`
+/// parameter instead, which has no set-after-create window.
+///
+/// Monotonic: a request to lower the epoch is rejected, because going
+/// backwards would re-admit traffic the fence has already excluded.
+///
+/// Returns 0 on success, -1 if the group is unknown, -2 if `epoch` is
+/// strictly less than the group's current epoch (regression rejected).
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_set_epoch(
+    m: *mut RaftManager,
+    group_id: u64,
+    epoch: u64,
+) -> i32 {
+    if m.is_null() {
+        return -1;
+    }
+    let mgr = &mut *m;
+    match mgr.groups.get_mut(&group_id) {
+        Some(slot) => {
+            if epoch < slot.epoch {
+                return -2;
+            }
+            slot.epoch = epoch;
+            0
+        }
+        None => -1,
+    }
 }
 
 #[no_mangle]
@@ -654,14 +749,65 @@ pub unsafe extern "C" fn raft_manager_step(
     }
 }
 
-/// One entry in a batched step call: `(group_id, msg_bytes, msg_len)`.
-/// `msg_bytes` is the rust-protobuf serialization of a
-/// `raft::eraftpb::Message` (same as `raft_manager_step`). Layout is
-/// stable C ABI; callers building this array on the Zig side use
-/// `extern struct` so the layout matches exactly.
+/// Deliver an inbound raft message, fenced by the migration epoch.
+/// Identical to `raft_manager_step` except it first compares
+/// `sender_epoch` (the epoch the sending group was stamped with, read
+/// from `raft_manager_group_epoch` at the source) against the local
+/// group's current epoch. If `sender_epoch` is strictly older, the
+/// message belongs to a pre-migration incarnation of this group id and
+/// is dropped — the message never reaches raft, so its (post-reset)
+/// term cannot perturb the fresh group. See the `epoch / fence`
+/// block-comment for why term-based fencing is insufficient here.
+///
+/// Returns 0 on success, -1 if the group is unknown, -2 if the message
+/// fails to deserialize, -3 if `step` rejects it, -4 (`STEP_FENCED`)
+/// if the message is fenced (stale epoch). The fence check precedes
+/// the protobuf decode, so a flood of stale traffic costs only a
+/// compare per message.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_step_fenced(
+    m: *mut RaftManager,
+    group_id: u64,
+    sender_epoch: u64,
+    msg_bytes: *const u8,
+    msg_len: usize,
+) -> i32 {
+    if msg_bytes.is_null() {
+        return -2;
+    }
+    let mgr = &mut *m;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if sender_epoch < slot.epoch {
+        return STEP_FENCED;
+    }
+    let bytes = slice::from_raw_parts(msg_bytes, msg_len);
+    let msg = match Message::parse_from_bytes(bytes) {
+        Ok(m) => m,
+        Err(_) => return -2,
+    };
+    match slot.node.step(msg) {
+        Ok(()) => {
+            notify_locked(&slot.state, &mgr.pending, group_id);
+            0
+        }
+        Err(_) => -3,
+    }
+}
+
+/// One entry in a batched step call: `(group_id, epoch, msg_bytes,
+/// msg_len)`. `msg_bytes` is the rust-protobuf serialization of a
+/// `raft::eraftpb::Message` (same as `raft_manager_step`). `epoch` is
+/// the sender's stamped fence epoch (same role as `sender_epoch` in
+/// `raft_manager_step_fenced`); pass 0 for never-migrated groups.
+/// Layout is stable C ABI; callers building this array on the Zig side
+/// use `extern struct` so the layout matches exactly.
 #[repr(C)]
 pub struct RaftStepBatchEntry {
     pub group_id: u64,
+    pub epoch: u64,
     pub msg_bytes: *const u8,
     pub msg_len: usize,
 }
@@ -675,7 +821,10 @@ pub struct RaftStepBatchEntry {
 /// Mirrors `raft_manager_tick_groups`' skip-bad semantics: the batch
 /// API is for "fast path" delivery of trusted, well-formed messages
 /// from a peer; for per-message error inspection use `raft_manager_step`
-/// instead.
+/// instead. The migration fence applies here too — an entry whose
+/// `epoch` is strictly older than its group's current epoch is dropped
+/// (counted as a skip, not a success), so the coalesced fast path is
+/// no easier to bypass the fence on than single-message `step_fenced`.
 ///
 /// One FFI call per batch — the Zig↔C↔Rust boundary crossing is the
 /// bulk of the per-message cost; amortizing it across an envelope of
@@ -701,6 +850,9 @@ pub unsafe extern "C" fn raft_manager_step_batch(
             Some(s) => s,
             None => continue, // unknown group, skip
         };
+        if e.epoch < slot.epoch {
+            continue; // stale incarnation — fenced, skip
+        }
         let bytes = if e.msg_len == 0 {
             &[]
         } else {
