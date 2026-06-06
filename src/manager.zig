@@ -710,3 +710,84 @@ test "HardState.commit: compact-then-recover round-trips and re-opens" {
     try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs2); // must not panic
     try testing.expect(mgr.groupCount() == 1);
 }
+
+// ── Threaded group-creation repro (BUG-e2c4aea-process-ready-confchange-gpf) ──
+//
+// The bug report claims a threaded host SIGSEGVs in `confchange::restore`
+// at `RawNode::new` on the first `createGroup` over a fresh WAL — and that
+// the same lifecycle on the main thread is fine. This mirrors a host's
+// pump thread: the full `createGroup` -> `campaign` -> `propose` -> pump
+// cycle runs on a NON-main `std.Thread` over a fresh empty WAL. If the
+// report's "threaded-only" trigger is real, this test faults. As of
+// e2c4aea it passes, which means the crash is not reproduced by the
+// threaded lifecycle alone — the trigger is more environment-specific
+// than the report's framing. Kept as the in-tree anchor for any future
+// repro and for the controlled A/B against `Cargo.lock`.
+
+const ThreadReproApply = struct {
+    fn cb(ud: ?*anyopaque, gid: u64, idx: u64, term: u64, data: [*c]const u8, len: usize) callconv(.c) void {
+        _ = ud;
+        _ = gid;
+        _ = idx;
+        _ = term;
+        _ = data;
+        _ = len;
+    }
+};
+
+/// Pump until quiescent: tick, drain ready, process + release each group.
+fn threadReproPump(mgr: *Manager) !void {
+    var buf: [8]u64 = undefined;
+    var i: u32 = 0;
+    while (i < 40) : (i += 1) {
+        mgr.tickAll();
+        const r = mgr.pollReady(&buf);
+        for (r) |g| {
+            try mgr.processReady(g, ThreadReproApply.cb, null);
+            mgr.release(g);
+        }
+    }
+}
+
+/// The whole group lifecycle, run on a spawned thread. Errors are routed
+/// back through `err_out` so the test thread can surface them; a SIGSEGV
+/// (the reported failure mode) takes the process down regardless.
+fn threadReproWorker(wal_path: []const u8, err_out: *?anyerror) void {
+    threadReproBody(wal_path) catch |e| {
+        err_out.* = e;
+    };
+}
+
+fn threadReproBody(wal_path: []const u8) !void {
+    const a = std.heap.page_allocator;
+    const wal = try SharedWal.init(a, wal_path);
+    defer wal.deinit();
+    const gfs = try GroupedFileStorage.init(a, &.{1}, wal, 1);
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    // The report's crash site: createGroup -> RawNode::new -> confchange::restore.
+    try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+    try mgr.campaign(1);
+    try threadReproPump(&mgr);
+    var n: u32 = 0;
+    while (n < 5) : (n += 1) {
+        try mgr.propose(1, "x");
+        try threadReproPump(&mgr);
+    }
+    try wal.flush();
+}
+
+test "threaded createGroup over fresh WAL on a spawned thread does not crash" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    var worker_err: ?anyerror = null;
+    const t = try std.Thread.spawn(.{}, threadReproWorker, .{ wal_path, &worker_err });
+    t.join();
+    if (worker_err) |e| return e;
+}
