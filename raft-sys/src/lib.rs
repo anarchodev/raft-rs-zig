@@ -1002,6 +1002,29 @@ pub unsafe extern "C" fn raft_manager_process_ready(
 
     slot.node.advance_apply();
 
+    // The commit index advances in the `LightReady`, NOT in `ready.hs()`.
+    // `ready.hs()` is `Some` only when term/vote changed during message/
+    // tick processing; a leader's commit advancing on quorum (trivially
+    // itself on a single node) surfaces here. Drop it on the floor and a
+    // restart recovers a stale durable commit (0 for a fresh single-node
+    // leader), which panics `RawNode::new`'s `first_index-1 <= hs.commit`
+    // invariant the moment the log is compacted. Persist it, reading the
+    // current term/vote from the node so the record is complete (only
+    // `commit` changed). Rides the caller's existing per-cycle fsync.
+    if let Some(commit) = light_rd.commit_index() {
+        if let Some(set_hs) = (*vtable_ptr).set_hard_state {
+            let st = slot.node.raft.hard_state();
+            let hs_ffi = RaftHardStateFfi {
+                term: st.term,
+                vote: st.vote,
+                commit,
+            };
+            if set_hs(store_userdata, &hs_ffi) != 0 {
+                return -2;
+            }
+        }
+    }
+
     // Serialize the parked messages and push to the outbox. The
     // caller drains it via `raft_manager_take_messages` and
     // routes each to its `to` recipient.

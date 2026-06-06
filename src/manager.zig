@@ -585,3 +585,128 @@ test "Manager: stepBatch fences stale-epoch entries (skipped, not stepped)" {
     }};
     try testing.expectEqual(@as(usize, 1), dst.stepBatch(&current));
 }
+
+// ── HardState.commit persistence regression (BUG-hardstate-commit-not-persisted) ─
+//
+// `processReady` must persist the commit index that advances in the
+// `LightReady` returned by `advance`, not only `ready.hs()`. A leader's
+// commit advances in the LightReady; if it's dropped, the durable
+// `HardState.commit` stays at its pre-advance value (0 for a fresh
+// single-node leader). That's a silent durability gap without
+// compaction (re-election re-derives the commit) and a hard panic with
+// it (`RawNode::new` asserts `first_index-1 <= hs.commit`). These two
+// tests pin both: the recovered commit must equal the last committed
+// index, and a compacted+recovered group must re-open.
+
+/// Apply callback that records the highest applied index it sees.
+const HsReproApply = struct {
+    var last: u64 = 0;
+    fn reset() void {
+        last = 0;
+    }
+    fn cb(ud: ?*anyopaque, gid: u64, idx: u64, term: u64, data: [*c]const u8, len: usize) callconv(.c) void {
+        _ = ud;
+        _ = gid;
+        _ = term;
+        _ = data;
+        _ = len;
+        last = idx;
+    }
+};
+
+/// Pump the manager until quiescent: tick, drain the ready channel,
+/// process + release each group. Mirrors a host's pump loop.
+fn hsReproPump(mgr: *Manager) !void {
+    var buf: [8]u64 = undefined;
+    var i: u32 = 0;
+    while (i < 40) : (i += 1) {
+        mgr.tickAll();
+        const r = mgr.pollReady(&buf);
+        for (r) |g| {
+            try mgr.processReady(g, HsReproApply.cb, null);
+            mgr.release(g);
+        }
+    }
+}
+
+test "HardState.commit: recovered commit equals last committed index (no compaction)" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    var last_committed: u64 = 0;
+    {
+        const wal = try SharedWal.init(a, wal_path);
+        defer wal.deinit();
+        const gfs = try GroupedFileStorage.init(a, &.{1}, wal, 1);
+        var mgr = try Manager.init();
+        defer mgr.deinit();
+        try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+        try mgr.campaign(1);
+        HsReproApply.reset();
+        try hsReproPump(&mgr);
+        var n: u32 = 0;
+        while (n < 5) : (n += 1) {
+            try mgr.propose(1, "x");
+            try hsReproPump(&mgr);
+        }
+        try wal.flush();
+        last_committed = gfs.mem.lastIndex();
+    }
+
+    const wal = try SharedWal.open(a, wal_path);
+    defer wal.deinit();
+    const gfs2 = try GroupedFileStorage.initRecover(a, &.{1}, wal, 1);
+    defer gfs2.deinit();
+    // The masked bug: hs_commit recovered as 0. After the fix it tracks
+    // the durable commit, which on a single-node leader is the last
+    // committed index.
+    try testing.expect(last_committed > 0);
+    try testing.expectEqual(last_committed, gfs2.mem.hs_commit);
+}
+
+test "HardState.commit: compact-then-recover round-trips and re-opens" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    {
+        const wal = try SharedWal.init(a, wal_path);
+        defer wal.deinit();
+        const gfs = try GroupedFileStorage.init(a, &.{1}, wal, 1);
+        var mgr = try Manager.init();
+        defer mgr.deinit();
+        try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+        try mgr.campaign(1);
+        HsReproApply.reset();
+        try hsReproPump(&mgr);
+        var n: u32 = 0;
+        while (n < 5) : (n += 1) {
+            try mgr.propose(1, "x");
+            try hsReproPump(&mgr);
+        }
+        try wal.flush();
+        try gfs.compact(2); // application checkpointed through index 2
+        try wal.flush();
+    }
+
+    const wal = try SharedWal.open(a, wal_path);
+    defer wal.deinit();
+    const gfs2 = try GroupedFileStorage.initRecover(a, &.{1}, wal, 1);
+    // first_index is now 2; before the fix hs_commit recovered as 0 and
+    // `createGroup` -> `RawNode::new` panicked "hs.commit 0 out of range".
+    try testing.expect(gfs2.mem.entries.items[0].index == 2);
+    try testing.expect(gfs2.mem.hs_commit >= gfs2.mem.entries.items[0].index);
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs2); // must not panic
+    try testing.expect(mgr.groupCount() == 1);
+}
