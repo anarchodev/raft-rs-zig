@@ -21,6 +21,15 @@ cbindgen = "0.27"
 
 [profile.dev]
 panic = "abort"
+# opt-level >= 1 makes the SSE/AVX intrinsics (e.g. _mm_movemask_epi8) inline to
+# a single instruction instead of an -O0 helper that loads a 16/32-byte constant
+# with `movaps`/`vmovaps`. At -O0 those constant-pool sections (.rodata.cst16/
+# .cst32) are emitted under-aligned and Zig's self-hosted debug linker does not
+# raise them to entsize alignment, so the aligned SSE load #GP-faults depending
+# on binary layout. opt-level=1 removes the constant-pool load entirely, so the
+# crash cannot occur regardless of linker section-alignment behavior. Keeps
+# debug info. See docs/BUG-e2c4aea-process-ready-confchange-gpf.md.
+opt-level = 1
 
 [profile.release]
 panic = "abort"

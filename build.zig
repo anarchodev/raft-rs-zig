@@ -28,23 +28,27 @@ pub fn build(b: *std.Build) void {
     const release = optimize != .Debug;
     const profile_dir: []const u8 = if (release) "release" else "debug";
 
-    // Build the Rust raft-sys static library.
+    // Build the Rust raft-sys static library. Redirect cargo's output into a
+    // build-tracked directory so the produced `.a` is a LazyPath: adding it via
+    // `addObjectFile` then creates an automatic build dependency (and triggers
+    // cargo) wherever the module is used — no wrapper artifact required.
     const cargo = b.addSystemCommand(&.{ "cargo", "build" });
     if (release) cargo.addArg("--release");
     cargo.addArg("--manifest-path");
     cargo.addFileArg(b.path("raft-sys/Cargo.toml"));
+    const cargo_out = cargo.addPrefixedOutputDirectoryArg("--target-dir=", "cargo-target");
+    const libsys = cargo_out.path(b, b.fmt("{s}/libraft_sys.a", .{profile_dir}));
 
-    // The public Zig module. Library paths + linked system libs
-    // are declared here so they propagate to anything that imports
-    // the module (the static library below + consumers).
+    // The public Zig module. The prebuilt raft-sys static lib is linked as a
+    // single object input (canonical for an external `.a` at a known path);
+    // these link settings propagate to anything that imports the module.
     const mod = b.addModule("raft_rs_zig", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     mod.addIncludePath(b.path("raft-sys/include"));
-    mod.addLibraryPath(b.path(b.fmt("raft-sys/target/{s}", .{profile_dir})));
-    mod.linkSystemLibrary("raft_sys", .{});
+    mod.addObjectFile(libsys);
     mod.link_libc = true;
     if (target.result.os.tag == .linux) {
         // Required by the Rust runtime: pthread for std::thread,
@@ -55,18 +59,6 @@ pub fn build(b: *std.Build) void {
         mod.linkSystemLibrary("m", .{});
         mod.linkSystemLibrary("gcc_s", .{});
     }
-
-    // Static library wrapping the module — gives consumers a
-    // single artifact to link. Crucially, the artifact depends
-    // on the cargo step; linking it from a consumer's exe
-    // triggers the cargo build automatically.
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "raft_rs_zig",
-        .root_module = mod,
-    });
-    lib.step.dependOn(&cargo.step);
-    b.installArtifact(lib);
 
     // Spike exe — the demo. Same module, uses the library API.
     const exe_mod = b.createModule(.{
