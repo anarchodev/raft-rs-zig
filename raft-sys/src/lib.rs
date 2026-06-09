@@ -389,6 +389,17 @@ struct GroupSlot {
     /// Mailbox state — `NOTIFY_IDLE` / `NOTIFY_NOTIFIED` / `NOTIFY_DROP`.
     /// See the `mailbox` block-comment above.
     state: AtomicU8,
+    /// Readies appended-but-not-yet-fsynced: `(ready number,
+    /// persisted messages)` stashed by `raft_manager_process_ready`'s
+    /// async-append flow and released by `raft_manager_on_persist`
+    /// once the caller's WAL fsync covers them. The messages here are
+    /// the ones raft REQUIRES durable local state for (append acks,
+    /// vote responses) — holding them until the fsync is what makes a
+    /// follower's ack mean "durably stored", and acking raft's own
+    /// persist watermark (`on_persist_ready`) only after the fsync is
+    /// what keeps the LEADER's self-vote out of the commit quorum for
+    /// entries that are still volatile.
+    pending_persist: Vec<(u64, Vec<(u64, Vec<u8>)>)>,
     /// Migration fence epoch — see the `epoch / fence` block-comment
     /// below. The group's current incarnation number. `step_fenced`
     /// rejects any inbound message stamped with a strictly-older
@@ -536,6 +547,7 @@ pub unsafe extern "C" fn raft_manager_create_group(
                     node,
                     outbox: Vec::new(),
                     state: AtomicU8::new(NOTIFY_IDLE),
+                    pending_persist: Vec::new(),
                     epoch,
                 },
             );
@@ -945,6 +957,7 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     };
 
     let mut ready = slot.node.ready();
+    let ready_number = ready.number();
 
     // Persist hard state.
     if let Some(hs) = ready.hs() {
@@ -991,47 +1004,94 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     // them to slot.outbox here would conflict with the live
     // borrow `ready` holds on slot.node. We park them, drop
     // `ready`, then push.
+    //
+    // ASYNC-APPEND SPLIT (persist-before-quorum ordering): raft
+    // distinguishes messages that may leave BEFORE this ready's
+    // writes are durable (`messages()` — e.g. a leader's MsgAppend
+    // fan-out, which asserts nothing about local durability) from
+    // messages that must wait for the fsync (`persisted_messages()`
+    // — append acks / vote responses, which DO assert it). The old
+    // sync flow pushed both to the outbox and called
+    // `advance(ready)`, which marks the ready persisted immediately
+    // — so the LEADER's own un-fsynced append counted toward the
+    // commit quorum, and on a single voter an entry could commit,
+    // apply, and (until the node-level commit hook moved post-flush)
+    // be acked entirely ahead of the fsync. Now the ready is only
+    // RECORDED (`advance_append_async`); its number + persisted
+    // messages stash on the slot until the caller's WAL fsync
+    // completes and `raft_manager_on_persist` acks them — raft's
+    // commit math then counts this node only once its entries are
+    // truly durable. Committed entries handed out by THIS ready are
+    // already gated by raft on the persist watermark (they were
+    // fsynced in an earlier cycle), so applying them here is safe.
     let ready_msgs = ready.take_messages();
     let persisted_msgs = ready.take_persisted_messages();
 
     apply_committed(group_id, ready.take_committed_entries(), cb, userdata);
 
-    let mut light_rd = slot.node.advance(ready);
-    let light_msgs = light_rd.take_messages();
-    apply_committed(group_id, light_rd.take_committed_entries(), cb, userdata);
-
+    slot.node.advance_append_async(ready);
     slot.node.advance_apply();
 
-    // The commit index advances in the `LightReady`, NOT in `ready.hs()`.
-    // `ready.hs()` is `Some` only when term/vote changed during message/
-    // tick processing; a leader's commit advancing on quorum (trivially
-    // itself on a single node) surfaces here. Drop it on the floor and a
-    // restart recovers a stale durable commit (0 for a fresh single-node
-    // leader), which panics `RawNode::new`'s `first_index-1 <= hs.commit`
-    // invariant the moment the log is compacted. Persist it, reading the
-    // current term/vote from the node so the record is complete (only
-    // `commit` changed). Rides the caller's existing per-cycle fsync.
-    if let Some(commit) = light_rd.commit_index() {
-        if let Some(set_hs) = (*vtable_ptr).set_hard_state {
-            let st = slot.node.raft.hard_state();
-            let hs_ffi = RaftHardStateFfi {
-                term: st.term,
-                vote: st.vote,
-                commit,
-            };
-            if set_hs(store_userdata, &hs_ffi) != 0 {
-                return -2;
-            }
+    // (The old sync flow's LightReady commit-index persistence is
+    // gone with it: in the async flow a commit advance surfaces as a
+    // changed `hs()` in a SUBSEQUENT ready — after `on_persist` —
+    // and rides the normal hard-state persist above, one fsync
+    // behind the advance. That lag is safe: raft only requires the
+    // durable commit to be ≥ the compaction point, and compaction is
+    // driven off the durabilized apply watermark, which itself trails
+    // the persisted commit.)
+
+    push_messages(&mut slot.outbox, ready_msgs);
+
+    // Hold the persistence-asserting messages until the fsync; an
+    // empty stash entry still records the number so `on_persist`
+    // acks every ready in order.
+    let mut stashed: Vec<(u64, Vec<u8>)> = Vec::with_capacity(persisted_msgs.len());
+    push_messages(&mut stashed, persisted_msgs);
+    slot.pending_persist.push((ready_number, stashed));
+
+    0
+}
+
+/// Acknowledge that every ready `raft_manager_process_ready` produced
+/// for this group SO FAR has been made durable (the caller's WAL
+/// fsync covers them). Releases the stashed persistence-asserting
+/// messages to the outbox and advances raft's persist watermark
+/// (`on_persist_ready`) — the point at which this node's own entries
+/// start counting toward the commit quorum. The caller MUST invoke
+/// this only after an fsync that covers the corresponding
+/// `process_ready` appends, and should poll readiness again
+/// afterwards: entries that just became persisted commonly unlock a
+/// commit advance + committed entries to apply (surfaced as a fresh
+/// ready). Returns 0 on success (including "nothing pending" and
+/// unknown group — both no-ops).
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_on_persist(m: *mut RaftManager, group_id: u64) -> i32 {
+    let mgr = &mut *m;
+    let pending = &mgr.pending;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return 0,
+    };
+    if slot.pending_persist.is_empty() {
+        return 0;
+    }
+    let mut max_number: u64 = 0;
+    for (number, msgs) in slot.pending_persist.drain(..) {
+        if number > max_number {
+            max_number = number;
+        }
+        for m in msgs {
+            slot.outbox.push(m);
         }
     }
-
-    // Serialize the parked messages and push to the outbox. The
-    // caller drains it via `raft_manager_take_messages` and
-    // routes each to its `to` recipient.
-    push_messages(&mut slot.outbox, ready_msgs);
-    push_messages(&mut slot.outbox, persisted_msgs);
-    push_messages(&mut slot.outbox, light_msgs);
-
+    slot.node.on_persist_ready(max_number);
+    // The persist ack can unlock work (commit advance → committed
+    // entries) and the outbox may now hold the released acks — make
+    // sure the group surfaces in the ready channel either way.
+    if slot.node.has_ready() || !slot.outbox.is_empty() {
+        notify_locked(&slot.state, pending, group_id);
+    }
     0
 }
 

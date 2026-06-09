@@ -51,7 +51,11 @@ pub fn main() !void {
     while (pump < 10) : (pump += 1) {
         const ready = mgr.pollReady(&buf);
         if (ready.len == 0) break;
-        for (ready) |gid| try mgr.processReady(gid, applyCb, &ctx);
+        for (ready) |gid| {
+            try mgr.processReady(gid, applyCb, &ctx);
+            mgr.onPersist(gid); // MemStorage: durable at append
+            mgr.release(gid);
+        }
     }
 
     for (groups) |gid| {
@@ -75,7 +79,11 @@ pub fn main() !void {
     while (ctx.total < proposals.len and spin < 100) : (spin += 1) {
         mgr.tickAll();
         const ready = mgr.pollReady(&buf);
-        for (ready) |gid| try mgr.processReady(gid, applyCb, &ctx);
+        for (ready) |gid| {
+            try mgr.processReady(gid, applyCb, &ctx);
+            mgr.onPersist(gid); // MemStorage: durable at append
+            mgr.release(gid);
+        }
     }
 
     std.debug.print(

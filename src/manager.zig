@@ -242,6 +242,20 @@ pub const Manager = struct {
             return Error.ProcessReadyFailed;
     }
 
+    /// Acknowledge that every ready `processReady` produced for this
+    /// group so far is durable (the caller's WAL fsync covers it).
+    /// Releases the stashed persistence-asserting messages (append
+    /// acks / vote responses) to the outbox and advances raft's
+    /// persist watermark — the point at which THIS node's entries
+    /// count toward the commit quorum. Call only after an fsync that
+    /// covers the corresponding `processReady` appends, then poll
+    /// readiness again: a persist ack commonly unlocks a commit
+    /// advance with committed entries to apply (the group re-enters
+    /// the ready channel). Unknown group / nothing pending = no-op.
+    pub fn onPersist(self: *Manager, group_id: u64) void {
+        _ = c.raft_manager_on_persist(self.ptr, group_id);
+    }
+
     /// Release a group back to IDLE after the caller has drained
     /// its pending work (`processReady` + `takeMessages`). If new
     /// work landed during the round, the slot is re-notified so
@@ -408,6 +422,15 @@ fn noopApply(
 /// campaign it, and capture the real `RequestVote` bytes it emits to
 /// peer node 2 into `MsgCollector`'s static buffer. Returns the
 /// captured slice — a genuine eraftpb message, valid until the next
+/// processReady + immediate persist-ack — the sync-storage test
+/// shorthand (MemStorage is durable at append, so acking right after
+/// the append IS the faithful ordering; WAL-backed tests ack after
+/// `wal.flush()` instead).
+fn processReadyAndPersist(mgr: *Manager, g: u64, callback: ApplyCb, userdata: ?*anyopaque) !void {
+    try mgr.processReady(g, callback, userdata);
+    mgr.onPersist(g);
+}
+
 /// `MsgCollector.reset()`. Used by the fence tests so they exercise
 /// the decode path with a real message, not garbage.
 fn captureRealVote() ![]const u8 {
@@ -420,7 +443,12 @@ fn captureRealVote() ![]const u8 {
     mgr.tickAll();
     const ready = mgr.pollReady(&buf);
     try testing.expect(ready.len >= 1);
-    for (ready) |g| try mgr.processReady(g, noopApply, null);
+    for (ready) |g| {
+        try mgr.processReady(g, noopApply, null);
+        // MemStorage is durable at append; ack immediately so the vote
+        // request (a persistence-asserting message) reaches the outbox.
+        mgr.onPersist(g);
+    }
     MsgCollector.reset();
     try mgr.takeMessages(1, MsgCollector.cb, null);
     try testing.expectEqual(@as(u64, 2), MsgCollector.last_to);
@@ -449,7 +477,7 @@ test "Manager: take_messages drains the outbox after a campaign (multi-node sani
     mgr.tickAll();
     const ready = mgr.pollReady(&buf);
     try testing.expect(ready.len >= 1);
-    for (ready) |g| try mgr.processReady(g, struct {
+    for (ready) |g| try processReadyAndPersist(&mgr, g, struct {
         fn cb(
             ud: ?*anyopaque,
             gid: u64,
@@ -588,15 +616,19 @@ test "Manager: stepBatch fences stale-epoch entries (skipped, not stepped)" {
 
 // ── HardState.commit persistence regression (BUG-hardstate-commit-not-persisted) ─
 //
-// `processReady` must persist the commit index that advances in the
-// `LightReady` returned by `advance`, not only `ready.hs()`. A leader's
-// commit advances in the LightReady; if it's dropped, the durable
-// `HardState.commit` stays at its pre-advance value (0 for a fresh
-// single-node leader). That's a silent durability gap without
-// compaction (re-election re-derives the commit) and a hard panic with
-// it (`RawNode::new` asserts `first_index-1 <= hs.commit`). These two
-// tests pin both: the recovered commit must equal the last committed
-// index, and a compacted+recovered group must re-open.
+// The durable `HardState.commit` must track the advancing commit
+// index. Under the original sync flow that meant persisting the
+// commit the `LightReady` carried; under the async-append flow a
+// commit advance (post `onPersist`) surfaces as a changed `hs()` in a
+// SUBSEQUENT ready and rides the normal hard-state persist — one
+// fsync behind the advance, which is safe (raft only needs the
+// durable commit to stay ≥ the compaction point). If it were dropped
+// entirely, the durable commit would stay at its pre-advance value (0
+// for a fresh single-node leader): a silent durability gap without
+// compaction (re-election re-derives the commit) and a hard panic
+// with it (`RawNode::new` asserts `first_index-1 <= hs.commit`).
+// These two tests pin both: the recovered commit must equal the last
+// committed index, and a compacted+recovered group must re-open.
 
 /// Apply callback that records the highest applied index it sees.
 const HsReproApply = struct {
@@ -615,18 +647,81 @@ const HsReproApply = struct {
 };
 
 /// Pump the manager until quiescent: tick, drain the ready channel,
-/// process + release each group. Mirrors a host's pump loop.
-fn hsReproPump(mgr: *Manager) !void {
+/// process each group, fsync the shared WAL, ACK persistence (the
+/// async-append flow — commit only advances after the ack), then
+/// release. Mirrors a host's pump loop.
+fn hsReproPump(mgr: *Manager, wal: *SharedWal) !void {
     var buf: [8]u64 = undefined;
     var i: u32 = 0;
     while (i < 40) : (i += 1) {
         mgr.tickAll();
         const r = mgr.pollReady(&buf);
+        for (r) |g| try mgr.processReady(g, HsReproApply.cb, null);
+        try wal.flush();
         for (r) |g| {
-            try mgr.processReady(g, HsReproApply.cb, null);
+            mgr.onPersist(g);
             mgr.release(g);
         }
     }
+}
+
+test "async-append: commit waits for the persist ack (no quorum from volatile entries)" {
+    // The persist-before-quorum property this module's async-append
+    // flow exists for: a proposed entry is appended (buffered) by
+    // `processReady`, but it must NOT commit — and the apply callback
+    // must NOT fire — until `onPersist` acks that the WAL fsync covers
+    // it. Under the old sync flow (`advance` inside `processReady`)
+    // the single voter's own un-fsynced append satisfied quorum
+    // instantly, so an entry could commit + apply entirely ahead of
+    // the fsync; on a multi-node leader the same early self-ack let
+    // commit be reached with one durable copy fewer than quorum.
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    const wal = try SharedWal.init(a, wal_path);
+    defer wal.deinit();
+    const gfs = try GroupedFileStorage.init(a, &.{1}, wal, 1);
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+    try mgr.campaign(1);
+    HsReproApply.reset();
+    try hsReproPump(&mgr, wal); // elect (with proper flush+ack)
+    try testing.expect(mgr.isLeader(1));
+    const applied_after_elect = HsReproApply.last;
+
+    // Propose, then pump WITHOUT acking persistence (we even fsync —
+    // the gate is the ACK, not the physical flush). The entry must
+    // not commit/apply.
+    try mgr.propose(1, "gated");
+    var buf: [8]u64 = undefined;
+    var processed: [8]u64 = undefined;
+    var nproc: usize = 0;
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        mgr.tickAll();
+        const r = mgr.pollReady(&buf);
+        for (r) |g| {
+            try mgr.processReady(g, HsReproApply.cb, null);
+            if (nproc < processed.len) {
+                processed[nproc] = g;
+                nproc += 1;
+            }
+            mgr.release(g);
+        }
+        try wal.flush();
+    }
+    try testing.expectEqual(applied_after_elect, HsReproApply.last); // NOT applied
+
+    // Ack persistence → the commit unlocks and the next ready applies it.
+    for (processed[0..nproc]) |g| mgr.onPersist(g);
+    try hsReproPump(&mgr, wal);
+    try testing.expect(HsReproApply.last > applied_after_elect); // applied now
 }
 
 test "HardState.commit: recovered commit equals last committed index (no compaction)" {
@@ -648,11 +743,11 @@ test "HardState.commit: recovered commit equals last committed index (no compact
         try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
         try mgr.campaign(1);
         HsReproApply.reset();
-        try hsReproPump(&mgr);
+        try hsReproPump(&mgr, wal);
         var n: u32 = 0;
         while (n < 5) : (n += 1) {
             try mgr.propose(1, "x");
-            try hsReproPump(&mgr);
+            try hsReproPump(&mgr, wal);
         }
         try wal.flush();
         last_committed = gfs.mem.lastIndex();
@@ -687,11 +782,11 @@ test "HardState.commit: compact-then-recover round-trips and re-opens" {
         try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
         try mgr.campaign(1);
         HsReproApply.reset();
-        try hsReproPump(&mgr);
+        try hsReproPump(&mgr, wal);
         var n: u32 = 0;
         while (n < 5) : (n += 1) {
             try mgr.propose(1, "x");
-            try hsReproPump(&mgr);
+            try hsReproPump(&mgr, wal);
         }
         try wal.flush();
         try gfs.compact(2); // application checkpointed through index 2
@@ -736,14 +831,16 @@ const ThreadReproApply = struct {
 };
 
 /// Pump until quiescent: tick, drain ready, process + release each group.
-fn threadReproPump(mgr: *Manager) !void {
+fn threadReproPump(mgr: *Manager, wal: *SharedWal) !void {
     var buf: [8]u64 = undefined;
     var i: u32 = 0;
     while (i < 40) : (i += 1) {
         mgr.tickAll();
         const r = mgr.pollReady(&buf);
+        for (r) |g| try mgr.processReady(g, ThreadReproApply.cb, null);
+        try wal.flush();
         for (r) |g| {
-            try mgr.processReady(g, ThreadReproApply.cb, null);
+            mgr.onPersist(g);
             mgr.release(g);
         }
     }
@@ -768,11 +865,11 @@ fn threadReproBody(wal_path: []const u8) !void {
     // The report's crash site: createGroup -> RawNode::new -> confchange::restore.
     try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
     try mgr.campaign(1);
-    try threadReproPump(&mgr);
+    try threadReproPump(&mgr, wal);
     var n: u32 = 0;
     while (n < 5) : (n += 1) {
         try mgr.propose(1, "x");
-        try threadReproPump(&mgr);
+        try threadReproPump(&mgr, wal);
     }
     try wal.flush();
 }
