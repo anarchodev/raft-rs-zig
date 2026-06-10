@@ -65,6 +65,11 @@ pub const Error = error{
     ClearTombstoneFailed,
     CampaignFailed,
     ProposeFailed,
+    /// The propose was refused because this node is not the group's
+    /// raft leader — nothing was stepped into raft, so nothing can
+    /// commit from it. (Backstop for raft-rs 0.7's unconditional
+    /// follower proposal forwarding; see raft_manager_propose.)
+    NotLeader,
     ProcessReadyFailed,
     TakeMessagesFailed,
     StepFailed,
@@ -192,8 +197,9 @@ pub const Manager = struct {
     /// application happens via `processReady` after the entry
     /// commits.
     pub fn propose(self: *Manager, group_id: u64, data: []const u8) Error!void {
-        if (c.raft_manager_propose(self.ptr, group_id, data.ptr, data.len) != 0)
-            return Error.ProposeFailed;
+        const rc = c.raft_manager_propose(self.ptr, group_id, data.ptr, data.len);
+        if (rc == -2) return Error.NotLeader;
+        if (rc != 0) return Error.ProposeFailed;
     }
 
     /// Drive the per-group election/heartbeat/snapshot timers

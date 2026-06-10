@@ -725,6 +725,16 @@ pub unsafe extern "C" fn raft_manager_propose(
         Some(s) => s,
         None => return -1,
     };
+    // Leader gate: raft-rs 0.7's `step_follower` FORWARDS MsgPropose to
+    // the known leader (this version has no disable_proposal_forwarding),
+    // so a follower-side propose would commit cluster-wide while the
+    // caller's local commit tracking faults the seq — "write failed" with
+    // the write durable. The bridge contract is the inverse ("a rejected
+    // propose never commits"): refuse here, before raft sees the message.
+    // -2 maps to Error.NotLeader in manager.zig.
+    if slot.node.raft.state != StateRole::Leader {
+        return -2;
+    }
     let bytes = if len == 0 {
         Vec::new()
     } else {
