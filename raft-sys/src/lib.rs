@@ -9,7 +9,7 @@ use protobuf::Message as PbMessage;
 use raft::eraftpb::{ConfState, HardState, Snapshot, SnapshotMetadata};
 use raft::prelude::*;
 use raft::storage::Storage;
-use raft::{Config, GetEntriesContext, RaftState, RawNode, StateRole};
+use raft::{Config, GetEntriesContext, RaftState, RawNode, ReadOnlyOption, StateRole};
 use slog::{o, Discard, Logger};
 
 // ─── Flat FFI types for crossing the boundary ───────────────────────────────
@@ -499,6 +499,33 @@ pub unsafe extern "C" fn raft_manager_free(m: *mut RaftManager) {
     }
 }
 
+/// C-ABI mirror of the tunable subset of `raft::Config`, passed to
+/// `raft_manager_create_group` (NULL = historical defaults). `id` is
+/// intentionally absent — it comes from the `node_id` argument. Field
+/// semantics and validation rules are raft-rs 0.7's; the values are
+/// mapped 1:1 into `raft::Config` and validated by `RawNode::new`, so
+/// an invalid combination surfaces as a -3 return rather than being
+/// silently clamped. `read_only_option`: 0 = Safe (default), 1 =
+/// LeaseBased (which also requires `check_quorum = true`).
+#[repr(C)]
+pub struct RaftGroupConfig {
+    pub election_tick: usize,
+    pub heartbeat_tick: usize,
+    pub applied: u64,
+    pub max_size_per_msg: u64,
+    pub max_inflight_msgs: usize,
+    pub check_quorum: bool,
+    pub pre_vote: bool,
+    pub min_election_tick: usize,
+    pub max_election_tick: usize,
+    pub read_only_option: u8,
+    pub skip_bcast_commit: bool,
+    pub batch_append: bool,
+    pub priority: i64,
+    pub max_uncommitted_size: u64,
+    pub max_committed_size_per_ready: u64,
+}
+
 /// Create a raft group backed by a caller-supplied storage vtable.
 ///
 /// `epoch` is the group's birth incarnation number for the migration
@@ -508,8 +535,12 @@ pub unsafe extern "C" fn raft_manager_free(m: *mut RaftManager) {
 /// group exists — closing the window a separate `set_epoch` after
 /// `create_group` would leave open.
 ///
+/// `group_cfg` tunes the group's `raft::Config` (see `RaftGroupConfig`);
+/// pass NULL for the historical defaults.
+///
 /// Returns 0 on success, -1 if a group with `group_id` exists, -2 if it is
-/// tombstoned, -3 on bad input or internal raft error.
+/// tombstoned, -3 on bad input or internal raft error (including an invalid
+/// `group_cfg`).
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_create_group(
     m: *mut RaftManager,
@@ -518,6 +549,7 @@ pub unsafe extern "C" fn raft_manager_create_group(
     epoch: u64,
     vtable: *const RaftStorageVTable,
     storage_userdata: *mut c_void,
+    group_cfg: *const RaftGroupConfig,
 ) -> i32 {
     if m.is_null() || vtable.is_null() || node_id == 0 {
         return -3;
@@ -533,11 +565,41 @@ pub unsafe extern "C" fn raft_manager_create_group(
         vtable: ptr::read(vtable),
         userdata: storage_userdata,
     };
-    let cfg = Config {
-        id: node_id,
-        election_tick: 10,
-        heartbeat_tick: 3,
-        ..Default::default()
+    // NULL config → the historical defaults (election_tick 10,
+    // heartbeat_tick 3, everything else `Config::default()`). A
+    // non-NULL config is mapped field-for-field; `RawNode::new`
+    // validates it and returns -3 on any invalid combination.
+    let cfg = if group_cfg.is_null() {
+        Config {
+            id: node_id,
+            election_tick: 10,
+            heartbeat_tick: 3,
+            ..Default::default()
+        }
+    } else {
+        let src = &*group_cfg;
+        Config {
+            id: node_id,
+            election_tick: src.election_tick,
+            heartbeat_tick: src.heartbeat_tick,
+            applied: src.applied,
+            max_size_per_msg: src.max_size_per_msg,
+            max_inflight_msgs: src.max_inflight_msgs,
+            check_quorum: src.check_quorum,
+            pre_vote: src.pre_vote,
+            min_election_tick: src.min_election_tick,
+            max_election_tick: src.max_election_tick,
+            read_only_option: if src.read_only_option == 1 {
+                ReadOnlyOption::LeaseBased
+            } else {
+                ReadOnlyOption::Safe
+            },
+            skip_bcast_commit: src.skip_bcast_commit,
+            batch_append: src.batch_append,
+            priority: src.priority,
+            max_uncommitted_size: src.max_uncommitted_size,
+            max_committed_size_per_ready: src.max_committed_size_per_ready,
+        }
     };
     match RawNode::new(&cfg, storage, &mgr.logger) {
         Ok(node) => {

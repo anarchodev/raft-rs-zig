@@ -37,6 +37,14 @@ pub fn build(b: *std.Build) void {
     cargo.addArg("--manifest-path");
     cargo.addFileArg(b.path("raft-sys/Cargo.toml"));
     const cargo_out = cargo.addPrefixedOutputDirectoryArg("--target-dir=", "cargo-target");
+    // Declare the Rust sources / build inputs as file inputs (not args)
+    // so the cargo step's cache key tracks them — otherwise editing
+    // `lib.rs` leaves the step cache-valid and zig links a STALE `.a`
+    // (the cbindgen header + FFI ABI silently lag the source).
+    cargo.addFileInput(b.path("raft-sys/src/lib.rs"));
+    cargo.addFileInput(b.path("raft-sys/build.rs"));
+    cargo.addFileInput(b.path("raft-sys/cbindgen.toml"));
+    cargo.addFileInput(b.path("raft-sys/Cargo.lock"));
     const libsys = cargo_out.path(b, b.fmt("{s}/libraft_sys.a", .{profile_dir}));
 
     // The public Zig module. The prebuilt raft-sys static lib is linked as a

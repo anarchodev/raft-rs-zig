@@ -34,6 +34,38 @@ pub const file_storage_vtable: *const c.RaftStorageVTable = @ptrCast(&file_stora
 pub const grouped_file_storage_vtable: *const c.RaftStorageVTable =
     @ptrCast(&grouped_file_storage_mod.vtable);
 
+/// Re-export of the C-ABI per-group raft config (the tunable subset of
+/// `raft::Config`). Build one with `defaultGroupConfig()` and tweak the
+/// fields you care about, then pass `&cfg` to `createGroupEpoch`.
+/// Passing `null` instead selects raft-sys's historical defaults
+/// (identical to `defaultGroupConfig()`).
+pub const GroupConfig = c.RaftGroupConfig;
+
+/// A valid `GroupConfig` carrying the defaults raft-sys has always used
+/// (raft-rs 0.7 defaults, except `election_tick`/`heartbeat_tick` which
+/// we pin to 10/3). Start here and override individual fields — e.g.
+/// `var cfg = defaultGroupConfig(); cfg.pre_vote = true;`. Every field
+/// below is chosen so `RawNode::new`'s `validate()` passes as-is.
+pub fn defaultGroupConfig() GroupConfig {
+    return .{
+        .election_tick = 10,
+        .heartbeat_tick = 3,
+        .applied = 0,
+        .max_size_per_msg = 0,
+        .max_inflight_msgs = 256,
+        .check_quorum = false,
+        .pre_vote = false,
+        .min_election_tick = 0, // 0 → raft uses election_tick
+        .max_election_tick = 0, // 0 → raft uses 2 * election_tick
+        .read_only_option = 0, // 0 = Safe, 1 = LeaseBased (needs check_quorum)
+        .skip_bcast_commit = false,
+        .batch_append = false,
+        .priority = 0,
+        .max_uncommitted_size = std.math.maxInt(u64), // raft's NO_LIMIT
+        .max_committed_size_per_ready = std.math.maxInt(u64), // raft's NO_LIMIT
+    };
+}
+
 /// Raw C-ABI apply callback signature. Re-exported so consumers
 /// don't have to repeat the calling-convention boilerplate.
 pub const ApplyCb = *const fn (
@@ -119,7 +151,8 @@ pub const Manager = struct {
         // Birth epoch 0 — the never-migrated case. A group that is
         // being attached as part of a migration uses
         // `createGroupEpoch` so the fence is live from creation.
-        return self.createGroupEpoch(group_id, node_id, 0, vtable, storage_userdata);
+        // `null` cfg → raft-sys defaults.
+        return self.createGroupEpoch(group_id, node_id, 0, vtable, storage_userdata, null);
     }
 
     /// `createGroup` with an explicit migration fence epoch (see
@@ -133,12 +166,18 @@ pub const Manager = struct {
         epoch: u64,
         vtable: *const c.RaftStorageVTable,
         storage_userdata: *anyopaque,
+        cfg: ?*const GroupConfig,
     ) Error!void {
         // `node_id` is this node's identity within the group's
         // voter set — must match one of the `voters` the storage
         // returns from `initial_state`. Single-node tests/demos
         // always pass 1; multi-node uses 1..=cluster_size.
-        const rc = c.raft_manager_create_group(self.ptr, group_id, node_id, epoch, vtable, storage_userdata);
+        //
+        // `cfg` tunes the group's raft::Config (pre_vote, check_quorum,
+        // election-tick window, …); `null` selects raft-sys defaults.
+        // An invalid config is rejected by RawNode::new → -3 →
+        // CreateGroupFailed.
+        const rc = c.raft_manager_create_group(self.ptr, group_id, node_id, epoch, vtable, storage_userdata, cfg);
         if (rc != 0) return Error.CreateGroupFailed;
     }
 
@@ -533,15 +572,42 @@ test "Manager: createGroupEpoch records the birth epoch" {
     var mgr = try Manager.init();
     defer mgr.deinit();
     const storage = try MemStorage.init(testing.allocator, &.{1});
-    try mgr.createGroupEpoch(1, 1, 7, storage_vtable, storage);
+    try mgr.createGroupEpoch(1, 1, 7, storage_vtable, storage, null);
     try testing.expectEqual(@as(u64, 7), mgr.groupEpoch(1));
+}
+
+test "Manager: createGroupEpoch accepts a tuned GroupConfig (pre_vote)" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    var cfg = defaultGroupConfig();
+    cfg.pre_vote = true;
+    cfg.check_quorum = true;
+    try mgr.createGroupEpoch(1, 1, 0, storage_vtable, storage, &cfg);
+    // A configured group is otherwise identical — campaign still drives
+    // it to leadership on a single-node voter set.
+    try mgr.campaign(1);
+    try testing.expect(mgr.isLeader(1));
+}
+
+test "Manager: createGroupEpoch rejects an invalid GroupConfig" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    var cfg = defaultGroupConfig();
+    // election_tick must be > heartbeat_tick; this fails raft's validate(),
+    // which surfaces as -3 → CreateGroupFailed (storage is freed by the
+    // destroy vtable on the failed-create path).
+    cfg.election_tick = 1;
+    cfg.heartbeat_tick = 3;
+    try testing.expectError(Error.CreateGroupFailed, mgr.createGroupEpoch(1, 1, 0, storage_vtable, storage, &cfg));
 }
 
 test "Manager: setEpoch is monotonic — raise allowed, regression rejected" {
     var mgr = try Manager.init();
     defer mgr.deinit();
     const storage = try MemStorage.init(testing.allocator, &.{1});
-    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage);
+    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage, null);
 
     try mgr.setEpoch(1, 5); // equal is fine
     try mgr.setEpoch(1, 8); // raise is fine
@@ -558,7 +624,7 @@ test "Manager: stepFenced drops stale-epoch messages before decode" {
     var mgr = try Manager.init();
     defer mgr.deinit();
     const storage = try MemStorage.init(testing.allocator, &.{1});
-    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage);
+    try mgr.createGroupEpoch(1, 1, 5, storage_vtable, storage, null);
 
     // Garbage bytes: a stale epoch is fenced *before* the protobuf
     // decode runs, so we get StepFenced — not StepDecodeFailed. That
@@ -584,7 +650,7 @@ test "Manager: migration fence — fresh incarnation rejects old-epoch traffic, 
     var dst = try Manager.init();
     defer dst.deinit();
     const dst_storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
-    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage);
+    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage, null);
 
     // Stamped with the previous incarnation's epoch (4) → fenced.
     try testing.expectError(Error.StepFenced, dst.stepFenced(1, 4, vote));
@@ -598,7 +664,7 @@ test "Manager: stepBatch fences stale-epoch entries (skipped, not stepped)" {
     var dst = try Manager.init();
     defer dst.deinit();
     const dst_storage = try MemStorage.init(testing.allocator, &.{ 1, 2 });
-    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage);
+    try dst.createGroupEpoch(1, 2, 5, storage_vtable, dst_storage, null);
 
     // The fence applies on the coalesced fast path too: a stale entry
     // is skipped (not counted as a successful step).
