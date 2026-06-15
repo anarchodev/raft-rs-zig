@@ -231,6 +231,18 @@ pub const Manager = struct {
         if (c.raft_manager_campaign(self.ptr, group_id) != 0) return Error.CampaignFailed;
     }
 
+    /// Graceful pre-shutdown leadership handoff: if this node leads
+    /// `group_id`, transfer leadership to the most caught-up follower
+    /// (voter) so a rolling restart costs ~one heartbeat instead of a full
+    /// election timeout. Returns the transferee node id when a transfer was
+    /// initiated, or null if this node does not lead the group, is the sole
+    /// voter, or the group is unknown. Drives `RawNode::transfer_leader`, so
+    /// it must be called on the thread that owns the Manager (the pump).
+    pub fn transferLeadershipAway(self: *Manager, group_id: u64) ?u64 {
+        const rc = c.raft_manager_transfer_leadership_away(self.ptr, group_id);
+        return if (rc > 0) @intCast(rc) else null;
+    }
+
     /// Propose an entry to `group_id`. Returns when the entry is
     /// in raft-rs's pending list, NOT when it's applied —
     /// application happens via `processReady` after the entry

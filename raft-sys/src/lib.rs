@@ -775,6 +775,64 @@ pub unsafe extern "C" fn raft_manager_campaign(m: *mut RaftManager, group_id: u6
     }
 }
 
+/// Graceful leadership handoff: if this node is the leader of `group_id`,
+/// pick the most caught-up *voter* other than self and transfer leadership
+/// to it (`RawNode::transfer_leader`). Called on graceful shutdown so a
+/// rolling restart costs ~one heartbeat per led group instead of a full
+/// election timeout (the new leader is hand-picked rather than elected after
+/// a timeout). Returns the chosen transferee id (> 0) when a transfer was
+/// initiated, 0 when this node is not the leader / is the sole voter / has no
+/// other voter to hand off to, -1 if the group is unknown.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_transfer_leadership_away(
+    m: *mut RaftManager,
+    group_id: u64,
+) -> i64 {
+    let mgr = &mut *m;
+    let pending = &mgr.pending;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state != StateRole::Leader {
+        return 0;
+    }
+    let self_id = slot.node.raft.id;
+    // Pick the voter (≠ self) with the highest `matched` index — the most
+    // caught-up follower, so raft-rs sends `MsgTimeoutNow` immediately
+    // instead of first streaming a backlog of appends to bring it current.
+    // Voters only: a learner can never become leader, so it is not a valid
+    // transferee. Scoped so the immutable `prs()` borrow ends before the
+    // mutable `transfer_leader` call below.
+    let best = {
+        let prs = slot.node.raft.prs();
+        let voters = prs.conf().voters();
+        let mut best: u64 = 0;
+        let mut best_matched: u64 = 0;
+        for (id, pr) in prs.iter() {
+            let id = *id;
+            if id == self_id || !voters.contains(id) {
+                continue;
+            }
+            if best == 0 || pr.matched > best_matched {
+                best = id;
+                best_matched = pr.matched;
+            }
+        }
+        best
+    };
+    if best == 0 {
+        // Sole voter or no other voter: nothing to hand off to.
+        return 0;
+    }
+    slot.node.transfer_leader(best);
+    // `transfer_leader` steps a `MsgTransferLeader` → the leader emits a
+    // `MsgTimeoutNow` to the transferee; that is outbound traffic + a pending
+    // state change, so wake the pump to drain it.
+    notify_locked(&slot.state, pending, group_id);
+    best as i64
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,
