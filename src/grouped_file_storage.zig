@@ -697,6 +697,39 @@ fn parseHardStatePayload(payload: []const u8) !c.RaftHardStateFfi {
 /// owns `*SharedWal` and tears it down after every `GroupedFileStorage`
 /// has been destroyed (via `destroyGroup`'s vtable callback). Destroying
 /// a group does NOT close the shared file.
+/// Application snapshot-generate hook. Same ABI as the storage vtable's
+/// `snapshot` callback, minus the leading userdata (the storage passes its own
+/// `snapshot_ctx`) and plus `group_id`. Returns 0 + fills the out-params on
+/// success, -1 for SnapshotTemporarilyUnavailable (the app is still preparing
+/// the snapshot — raft-rs retries), other negatives on error. The storage
+/// derives `out_meta_term` authoritatively from its own log, so the hook need
+/// only fill `out_data` + `out_meta_index`.
+pub const SnapshotProviderFn = *const fn (
+    ctx: ?*anyopaque,
+    group_id: u64,
+    request_index: u64,
+    out_data: [*c][*c]const u8,
+    out_data_len: [*c]usize,
+    out_meta_index: [*c]u64,
+    out_meta_term: [*c]u64,
+) callconv(.c) i32;
+
+/// Application snapshot-apply hook: install an inbound snapshot's application
+/// state (rove loads the tenant bundle the descriptor names into its store and
+/// stamps the durable watermark = `meta_index`). Called from `apply_snapshot`
+/// BEFORE the in-memory raft log is reset, so a failure (return != 0) aborts
+/// the apply with no torn state. The app is expected to have the snapshot bytes
+/// already staged locally (the pump defers the apply until then via
+/// `raft_manager_pending_snapshot`), so this is fast + synchronous.
+pub const ApplyHandlerFn = *const fn (
+    ctx: ?*anyopaque,
+    group_id: u64,
+    data: [*c]const u8,
+    data_len: usize,
+    meta_index: u64,
+    meta_term: u64,
+) callconv(.c) i32;
+
 pub const GroupedFileStorage = struct {
     allocator: std.mem.Allocator,
     /// Per-group read view + entry buffer — same role MemStorage plays
@@ -722,6 +755,19 @@ pub const GroupedFileStorage = struct {
     /// below it are dead on disk; segment GC uses this to decide when a
     /// whole segment can be reclaimed. 0 until the first `compact`.
     compaction_index: u64 = 0,
+
+    /// Optional application snapshot hooks (the consumer — rove — sets these
+    /// post-init via `setSnapshotHooks`). When `snapshot_provider` is set, the
+    /// storage's `snapshot` callback delegates to it (the app produces a
+    /// snapshot *descriptor* pointing at the materialized tenant state) instead
+    /// of the MemStorage stub that always reports SnapshotTemporarilyUnavailable.
+    /// `apply_handler` installs an inbound snapshot's application state (the app
+    /// loads the bundle the descriptor names + advances its durable watermark);
+    /// it runs from `apply_snapshot` BEFORE the in-memory log is reset. `ctx` is
+    /// opaque (rove's per-group handle).
+    snapshot_ctx: ?*anyopaque = null,
+    snapshot_provider: ?SnapshotProviderFn = null,
+    apply_handler: ?ApplyHandlerFn = null,
 
     /// Recovery counterpart to `init`: build the group, then replay the
     /// records `SharedWal.open` bucketed for it (drained from the WAL,
@@ -839,6 +885,22 @@ pub const GroupedFileStorage = struct {
             .scratch = .empty,
         };
         return self;
+    }
+
+    /// Wire the application's snapshot hooks (rove sets these right after
+    /// `init`/`initRecover`, while it still holds the `*GroupedFileStorage`).
+    /// Until set, `snapshot` reports SnapshotTemporarilyUnavailable (the
+    /// historical single-node behaviour) and `apply_snapshot` only resets the
+    /// in-memory log.
+    pub fn setSnapshotHooks(
+        self: *GroupedFileStorage,
+        ctx: ?*anyopaque,
+        provider: ?SnapshotProviderFn,
+        apply: ?ApplyHandlerFn,
+    ) void {
+        self.snapshot_ctx = ctx;
+        self.snapshot_provider = provider;
+        self.apply_handler = apply;
     }
 
     pub fn deinit(self: *GroupedFileStorage) void {
@@ -970,6 +1032,29 @@ fn snapshotCb(
     out_meta_term: [*c]u64,
 ) callconv(.c) i32 {
     const self: *GroupedFileStorage = @ptrCast(@alignCast(ud.?));
+    if (self.snapshot_provider) |provider| {
+        const rc = provider(
+            self.snapshot_ctx,
+            self.group_id,
+            request_index,
+            out_data,
+            out_data_len,
+            out_meta_index,
+            out_meta_term,
+        );
+        if (rc != 0) return rc; // -1 = TemporarilyUnavailable (still preparing)
+        const idx = out_meta_index.*;
+        // raft-rs requires the snapshot to cover at least `request_index`; if
+        // the app hasn't materialized that far yet, report Unavailable so raft
+        // retries (a later durabilize advances the materialized point).
+        if (idx < request_index) return -1;
+        // The log term at the snapshot index is authoritative — derive it from
+        // our own log rather than trusting the app. `idx` is the durabilized
+        // index, which is >= the compaction sentinel, so `termAt` resolves.
+        const t = self.mem.termAt(idx) orelse return -1;
+        out_meta_term.* = t;
+        return 0;
+    }
     return mem_storage.vtable.snapshot.?(
         self.mem,
         request_index,
@@ -1027,7 +1112,31 @@ fn applySnapshotCb(
     meta_term: u64,
 ) callconv(.c) i32 {
     const self: *GroupedFileStorage = @ptrCast(@alignCast(ud.?));
-    return mem_storage.vtable.apply_snapshot.?(self.mem, data, data_len, meta_index, meta_term);
+    // Install the application state FIRST (rove loads the staged tenant bundle
+    // into LMDB + stamps the durable watermark = meta_index). Only if that
+    // succeeds do we reset the raft log + persist the compaction anchor — so a
+    // crash before the state is durable leaves the node at its old position to
+    // re-receive the snapshot, never a torn half-applied state.
+    if (self.apply_handler) |apply| {
+        const rc = apply(self.snapshot_ctx, self.group_id, data, data_len, meta_index, meta_term);
+        if (rc != 0) return rc;
+    }
+    // Reset the in-memory log to the snapshot point + advance hardstate.
+    const rc = mem_storage.vtable.apply_snapshot.?(self.mem, data, data_len, meta_index, meta_term);
+    if (rc != 0) return rc;
+    // The log now starts above meta_index: drop the offset map to a lone
+    // sentinel slot and record the compaction watermark, mirroring `compact`.
+    self.compaction_index = meta_index;
+    self.entry_offsets.clearRetainingCapacity();
+    self.entry_offsets.append(self.allocator, 0) catch return -1;
+    // Persist a compaction marker so recovery anchors the sentinel at
+    // {meta_index, meta_term} even after the pre-snapshot segments are GC'd.
+    var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
+    std.mem.writeInt(u64, cp[0..8], meta_index, .little);
+    std.mem.writeInt(u64, cp[8..16], meta_term, .little);
+    _ = self.wal.appendRecord(self.group_id, .compaction, &cp) catch return -1;
+    self.wal.noteCompaction(self.group_id, meta_index) catch return -1;
+    return 0;
 }
 
 pub const vtable: c.RaftStorageVTable = .{

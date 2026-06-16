@@ -304,6 +304,15 @@ impl Storage for FfiStorage {
         let mut meta = SnapshotMetadata::default();
         meta.set_index(meta_index);
         meta.set_term(meta_term);
+        // A snapshot MUST carry the membership as-of its index, or the
+        // receiving follower restores an empty voter set. Source it from the
+        // storage's persisted RaftState (`initial_state`). Membership is fixed
+        // in the current scope (no conf_change), so the live conf_state is
+        // correct for any index; when conf_change lands, this must be the
+        // conf_state as-of `meta_index`.
+        if let Ok(rs) = self.initial_state() {
+            meta.set_conf_state(rs.conf_state);
+        }
         snap.set_metadata(meta);
         Ok(snap)
     }
@@ -833,6 +842,87 @@ pub unsafe extern "C" fn raft_manager_transfer_leadership_away(
     best as i64
 }
 
+/// Minimum `matched` index across all *voters* of `group_id` — the cluster-wide
+/// replication floor. Every voter has every entry at or below this index, so a
+/// node may compact its WAL up to here and still feed any peer from the log
+/// (and, if promoted, serve any voter without a snapshot). Only meaningful on
+/// the leader (a follower does not track peer progress); returns `u64::MAX` if
+/// this node is not the leader or the group is unknown, so the caller's
+/// `min(..)` compaction floor is never *lowered* by a follower or missing group.
+/// Read-only — no notify.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_min_match_index(
+    m: *const RaftManager,
+    group_id: u64,
+) -> u64 {
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return u64::MAX,
+    };
+    if slot.node.raft.state != StateRole::Leader {
+        return u64::MAX;
+    }
+    let self_id = slot.node.raft.id;
+    let prs = slot.node.raft.prs();
+    let voters = prs.conf().voters();
+    let mut min_matched: u64 = u64::MAX;
+    for (id, pr) in prs.iter() {
+        if !voters.contains(*id) {
+            continue; // learners don't gate compaction (not quorum members)
+        }
+        // The leader's own `matched` is its last index; including it is
+        // harmless (it never lowers the min). Keep self for symmetry with
+        // single-node, where {self} is the only voter and min = own match.
+        let m = if *id == self_id {
+            slot.node.raft.raft_log.last_index()
+        } else {
+            pr.matched
+        };
+        if m < min_matched {
+            min_matched = m;
+        }
+    }
+    min_matched
+}
+
+/// If `group_id` has a snapshot pending application (received from the leader
+/// via `MsgSnapshot`, staged in raft's unstable log but not yet installed),
+/// fill its descriptor bytes + index + term and return 1. Returns 0 if there
+/// is no pending snapshot, -1 if the group is unknown. Does NOT consume a
+/// ready: the caller uses this to stage the snapshot's application state
+/// locally BEFORE letting `process_ready` apply it (the apply is synchronous,
+/// so the payload the descriptor names must already be in hand). The `out_data`
+/// pointer is valid only for the duration of THIS call — copy it before any
+/// further mutation of the group.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_pending_snapshot(
+    m: *const RaftManager,
+    group_id: u64,
+    out_data: *mut *const u8,
+    out_data_len: *mut usize,
+    out_index: *mut u64,
+    out_term: *mut u64,
+) -> i32 {
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    match slot.node.snap() {
+        Some(snap) if !snap.is_empty() => {
+            let data = snap.get_data();
+            *out_data = data.as_ptr();
+            *out_data_len = data.len();
+            let meta = snap.get_metadata();
+            *out_index = meta.index;
+            *out_term = meta.term;
+            1
+        }
+        _ => 0,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,
@@ -1088,6 +1178,25 @@ pub unsafe extern "C" fn raft_manager_process_ready(
 
     let mut ready = slot.node.ready();
     let ready_number = ready.number();
+
+    // Apply an inbound snapshot FIRST — before hard state and entries. It
+    // resets the log to the snapshot index; persisting a hard state with
+    // commit = snapshot_index while the state machine does not yet hold that
+    // snapshot would be corrupt on a crash. The caller has already staged the
+    // snapshot's application bytes locally (see `raft_manager_pending_snapshot`
+    // — the pump defers `process_ready` until then), so the `apply_snapshot`
+    // hook installs them synchronously + durably here.
+    if !ready.snapshot().is_empty() {
+        let snap = ready.snapshot();
+        let idx = snap.get_metadata().index;
+        let term = snap.get_metadata().term;
+        let data = snap.get_data();
+        if let Some(apply_snap) = (*vtable_ptr).apply_snapshot {
+            if apply_snap(store_userdata, data.as_ptr(), data.len(), idx, term) != 0 {
+                return -4;
+            }
+        }
+    }
 
     // Persist hard state.
     if let Some(hs) = ready.hs() {
