@@ -1029,6 +1029,25 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
     0
 }
 
+/// The term of the log entry at `index` on `group_id` (for building a
+/// promote-back baseline: the leader reports `term(store.applied)` so the
+/// returning learner installs a baseline whose term matches the leader's log,
+/// or its appends would conflict-reject forever). Returns the term, or 0 if the
+/// index is compacted away / beyond the log / the group is unknown. Read-only.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_log_term(
+    m: *const RaftManager,
+    group_id: u64,
+    index: u64,
+) -> u64 {
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return 0,
+    };
+    slot.node.raft.raft_log.term(index).unwrap_or(0)
+}
+
 /// Install a DATA-FREE snapshot baseline at {index, term} into `group_id`'s
 /// LOCAL raft log (conf_change Phase 2 promote-back). The node must be a
 /// learner/follower that has fallen below the leader's compacted log floor — it
