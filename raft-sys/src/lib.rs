@@ -86,6 +86,12 @@ pub struct RaftStorageVTable {
     pub set_hard_state: Option<unsafe extern "C" fn(*mut c_void, *const RaftHardStateFfi) -> i32>,
     pub apply_snapshot:
         Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u64, u64) -> i32>,
+    /// Persist a new ConfState durably after a committed conf-change applies
+    /// (`raft_manager_process_ready` calls this with the `ConfState` returned by
+    /// `apply_conf_change`). The implementer must record it so a restart's
+    /// `initial_state` returns the updated membership. NULL = membership changes
+    /// are not durable (only the in-memory raft conf updates).
+    pub set_conf_state: Option<unsafe extern "C" fn(*mut c_void, *const RaftConfStateFfi) -> i32>,
     /// Called exactly once when the group is destroyed. Lets the implementer
     /// release any resources tied to `userdata`.
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
@@ -877,6 +883,101 @@ pub unsafe extern "C" fn raft_manager_min_match_index(
     min_matched
 }
 
+/// Propose a single-change `ConfChangeV2` on the LEADER of `group_id`.
+/// `change_type`: 0 = AddNode (add voter / promote a learner), 1 = RemoveNode,
+/// 2 = AddLearnerNode (add a learner / DEMOTE a voter to learner). Returns 0 on
+/// success, -1 unknown group, -2 not leader, -3 bad change_type, -4 quorum guard
+/// (a demote/remove that would leave < 2 voters is refused), -5 propose error.
+/// The committed change applies via `process_ready` (`apply_conf_change` +
+/// `set_conf_state`).
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_propose_conf_change(
+    m: *mut RaftManager,
+    group_id: u64,
+    node_id: u64,
+    change_type: u8,
+) -> i32 {
+    let mgr = &mut *m;
+    let pending = &mgr.pending;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state != StateRole::Leader {
+        return -2;
+    }
+    let cc_type = match change_type {
+        0 => ConfChangeType::AddNode,
+        1 => ConfChangeType::RemoveNode,
+        2 => ConfChangeType::AddLearnerNode,
+        _ => return -3,
+    };
+    // Quorum guard: refuse a demote/remove (anything that drops `node_id` from
+    // the voter set) that would leave fewer than 2 voters.
+    if change_type != 0 {
+        let prs = slot.node.raft.prs();
+        let voters = prs.conf().voters();
+        if voters.contains(node_id) {
+            let voter_count = prs.iter().filter(|(id, _)| voters.contains(**id)).count();
+            if voter_count <= 2 {
+                return -4;
+            }
+        }
+    }
+    let mut single = ConfChangeSingle::default();
+    single.set_node_id(node_id);
+    single.set_change_type(cc_type);
+    let mut cc = ConfChangeV2::default();
+    cc.set_changes(vec![single].into());
+    match slot.node.propose_conf_change(vec![], cc) {
+        Ok(()) => {
+            notify_locked(&slot.state, pending, group_id);
+            0
+        }
+        Err(_) => -5,
+    }
+}
+
+/// Read `group_id`'s current membership into caller buffers (voters + learners
+/// from the live progress tracker). `*_len` is set to the true count even if it
+/// exceeds the cap (so the caller can detect truncation). Returns 0, -1 unknown
+/// group. Read-only — no notify.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_conf_state(
+    m: *const RaftManager,
+    group_id: u64,
+    out_voters: *mut u64,
+    voters_cap: usize,
+    out_voters_len: *mut usize,
+    out_learners: *mut u64,
+    learners_cap: usize,
+    out_learners_len: *mut usize,
+) -> i32 {
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let prs = slot.node.raft.prs();
+    let mut vn = 0usize;
+    for id in prs.conf().voters().ids().iter() {
+        if vn < voters_cap {
+            *out_voters.add(vn) = id;
+        }
+        vn += 1;
+    }
+    *out_voters_len = vn;
+    let mut ln = 0usize;
+    for id in prs.conf().learners() {
+        if ln < learners_cap {
+            *out_learners.add(ln) = *id;
+        }
+        ln += 1;
+    }
+    *out_learners_len = ln;
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,
@@ -1201,10 +1302,50 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     let ready_msgs = ready.take_messages();
     let persisted_msgs = ready.take_persisted_messages();
 
-    apply_committed(group_id, ready.take_committed_entries(), cb, userdata);
+    // Apply committed entries: normal entries go to the callback now; conf-change
+    // entries are stashed and applied AFTER `advance_*` (they need `&mut
+    // slot.node` for `apply_conf_change`, which conflicts with the `ready` borrow).
+    let mut conf_changes: Vec<Entry> = Vec::new();
+    for entry in ready.take_committed_entries() {
+        if entry.data.is_empty() {
+            continue;
+        }
+        match entry.get_entry_type() {
+            EntryType::EntryNormal => cb(
+                userdata,
+                group_id,
+                entry.index,
+                entry.term,
+                entry.data.as_ptr(),
+                entry.data.len(),
+            ),
+            _ => conf_changes.push(entry), // ConfChange / ConfChangeV2
+        }
+    }
 
     slot.node.advance_append_async(ready);
     slot.node.advance_apply();
+
+    // Apply membership changes durably (slot.node is free now). For each
+    // committed conf-change: decode → `apply_conf_change` → persist the returned
+    // ConfState via the storage `set_conf_state` callback (so a restart's
+    // `initial_state` returns the updated membership). An `apply_conf_change`
+    // error is deterministic across replicas (no divergence) — log + skip; the
+    // propose-side quorum guard prevents invalid changes.
+    for entry in &conf_changes {
+        let cs = match entry.get_entry_type() {
+            EntryType::EntryConfChange => ConfChange::parse_from_bytes(&entry.data)
+                .ok()
+                .and_then(|cc| slot.node.apply_conf_change(&cc).ok()),
+            EntryType::EntryConfChangeV2 => ConfChangeV2::parse_from_bytes(&entry.data)
+                .ok()
+                .and_then(|cc| slot.node.apply_conf_change(&cc).ok()),
+            _ => None,
+        };
+        if let Some(cs) = cs {
+            persist_conf_state(vtable_ptr, store_userdata, &cs);
+        }
+    }
 
     // (The old sync flow's LightReady commit-index persistence is
     // gone with it: in the async flow a commit advance surfaces as a
@@ -1418,26 +1559,26 @@ pub unsafe extern "C" fn raft_manager_release(
     0
 }
 
-unsafe fn apply_committed(
-    group_id: u64,
-    entries: Vec<Entry>,
-    cb: RaftApplyCb,
+/// Build a `RaftConfStateFfi` from a `ConfState` (pointers borrow `cs` — valid
+/// only during the call) and hand it to the storage `set_conf_state` callback
+/// so the new membership is durable. No-op when the callback is unset.
+unsafe fn persist_conf_state(
+    vtable_ptr: *const RaftStorageVTable,
     userdata: *mut c_void,
+    cs: &ConfState,
 ) {
-    for entry in entries {
-        if entry.data.is_empty() {
-            continue;
-        }
-        if entry.get_entry_type() != EntryType::EntryNormal {
-            continue;
-        }
-        cb(
-            userdata,
-            group_id,
-            entry.index,
-            entry.term,
-            entry.data.as_ptr(),
-            entry.data.len(),
-        );
+    if let Some(set_cs) = (*vtable_ptr).set_conf_state {
+        let ffi = RaftConfStateFfi {
+            voters: cs.voters.as_ptr(),
+            voters_len: cs.voters.len(),
+            learners: cs.learners.as_ptr(),
+            learners_len: cs.learners.len(),
+            voters_outgoing: cs.voters_outgoing.as_ptr(),
+            voters_outgoing_len: cs.voters_outgoing.len(),
+            learners_next: cs.learners_next.as_ptr(),
+            learners_next_len: cs.learners_next.len(),
+            auto_leave: cs.auto_leave,
+        };
+        set_cs(userdata, &ffi);
     }
 }

@@ -128,6 +128,18 @@ pub const MemStorage = struct {
     /// log starts above 1 — the state through `index` lives in the
     /// application's snapshot (kvexp), not the raft log, so there are no
     /// entries to replay below it, only a sentinel to anchor `term`.
+    /// Replace the membership (voters + learners) after a committed conf-change.
+    /// Single changes (AddNode / RemoveNode / AddLearnerNode, default transition)
+    /// produce a NON-joint ConfState, so voters + learners fully describe it; a
+    /// transient joint config (voters_outgoing / learners_next) is not persisted
+    /// here (it never arises for the single-change path this engine uses).
+    pub fn setConfState(self: *MemStorage, voters: []const u64, learners: []const u64) !void {
+        self.voters.clearRetainingCapacity();
+        self.learners.clearRetainingCapacity();
+        try self.voters.appendSlice(self.allocator, voters);
+        try self.learners.appendSlice(self.allocator, learners);
+    }
+
     pub fn resetToSnapshot(self: *MemStorage, index: u64, term: u64) !void {
         for (self.entries.items) |e| {
             if (e.data.len > 0) self.allocator.free(e.data);
@@ -307,6 +319,14 @@ fn setHardStateCb(ud: ?*anyopaque, hs: [*c]const c.RaftHardStateFfi) callconv(.c
     return 0;
 }
 
+fn setConfStateCb(ud: ?*anyopaque, cs: [*c]const c.RaftConfStateFfi) callconv(.c) i32 {
+    const self: *MemStorage = @ptrCast(@alignCast(ud.?));
+    const v = if (cs.*.voters_len > 0) cs.*.voters[0..cs.*.voters_len] else &[_]u64{};
+    const l = if (cs.*.learners_len > 0) cs.*.learners[0..cs.*.learners_len] else &[_]u64{};
+    self.setConfState(v, l) catch return -1;
+    return 0;
+}
+
 fn applySnapshotCb(
     ud: ?*anyopaque,
     data: [*c]const u8,
@@ -332,6 +352,7 @@ pub const vtable: c.RaftStorageVTable = .{
     .append_entries = appendEntriesCb,
     .set_hard_state = setHardStateCb,
     .apply_snapshot = applySnapshotCb,
+    .set_conf_state = setConfStateCb,
     .destroy = destroyCb,
 };
 

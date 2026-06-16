@@ -97,6 +97,9 @@ pub const Error = error{
     ClearTombstoneFailed,
     CampaignFailed,
     ProposeFailed,
+    /// A conf-change demote/remove was refused because it would leave the
+    /// group with fewer than 2 voters (the propose-side quorum guard).
+    ConfChangeQuorumGuard,
     /// The propose was refused because this node is not the group's
     /// raft leader — nothing was stepped into raft, so nothing can
     /// commit from it. (Backstop for raft-rs 0.7's unconditional
@@ -250,6 +253,55 @@ pub const Manager = struct {
     /// *lowered* by it. Pump-thread only (reads the Manager).
     pub fn minMatchIndex(self: *const Manager, group_id: u64) u64 {
         return c.raft_manager_min_match_index(self.ptr, group_id);
+    }
+
+    /// Single-change membership operation, proposed on the leader of `group_id`.
+    pub const ConfChange = enum(u8) {
+        /// Add `node` as a voter, or promote an existing learner to voter.
+        add_voter = 0,
+        /// Remove `node` from the group entirely.
+        remove = 1,
+        /// Add `node` as a learner, or DEMOTE an existing voter to learner.
+        add_learner = 2,
+    };
+
+    /// Propose a membership change. Applies (and persists the new ConfState)
+    /// when the entry commits, via `processReady`. Pump-thread only.
+    /// `Error.NotLeader` off-leader; `Error.ConfChangeQuorumGuard` if a
+    /// demote/remove would drop below 2 voters.
+    pub fn proposeConfChange(self: *Manager, group_id: u64, node: u64, change: ConfChange) Error!void {
+        const rc = c.raft_manager_propose_conf_change(self.ptr, group_id, node, @intFromEnum(change));
+        return switch (rc) {
+            0 => {},
+            -2 => Error.NotLeader,
+            -4 => Error.ConfChangeQuorumGuard,
+            else => Error.ProposeFailed,
+        };
+    }
+
+    pub const ConfStateView = struct { voters: []const u64, learners: []const u64 };
+
+    /// Read `group_id`'s current membership into the caller's buffers; returns
+    /// slices into them (truncated to the buffer if membership is larger), or
+    /// null for an unknown group.
+    pub fn confState(self: *const Manager, group_id: u64, voters_buf: []u64, learners_buf: []u64) ?ConfStateView {
+        var vn: usize = 0;
+        var ln: usize = 0;
+        const rc = c.raft_manager_conf_state(
+            self.ptr,
+            group_id,
+            voters_buf.ptr,
+            voters_buf.len,
+            &vn,
+            learners_buf.ptr,
+            learners_buf.len,
+            &ln,
+        );
+        if (rc != 0) return null;
+        return .{
+            .voters = voters_buf[0..@min(vn, voters_buf.len)],
+            .learners = learners_buf[0..@min(ln, learners_buf.len)],
+        };
     }
 
     /// Propose an entry to `group_id`. Returns when the entry is

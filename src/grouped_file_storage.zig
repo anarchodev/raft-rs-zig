@@ -194,6 +194,12 @@ pub const SharedWal = struct {
     /// always find a group's snapshot point even after the segment that
     /// first recorded it has been GC'd.
     compaction_cache: std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8),
+    /// Latest ConfState (membership) payload seen per group, re-emitted in
+    /// each new segment's header so a conf-change survives GC of the segment
+    /// that first recorded it. Variable-length (voters + learners), so the
+    /// value is an owned slice (freed on replace / deinit) — unlike the
+    /// fixed-size hardstate/compaction caches.
+    confstate_cache: std.AutoHashMap(u64, []u8),
     /// Per-group compaction watermark (mirrors each group's
     /// `compaction_index`), pushed in via `noteCompaction`; drives GC.
     /// Not persisted — rebuilt as groups re-compact after a restart.
@@ -235,10 +241,29 @@ pub const SharedWal = struct {
             .active_group_max = std.AutoHashMap(u64, u64).init(allocator),
             .hardstate_cache = std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8).init(allocator),
             .compaction_cache = std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8).init(allocator),
+            .confstate_cache = std.AutoHashMap(u64, []u8).init(allocator),
             .compaction = std.AutoHashMap(u64, u64).init(allocator),
             .recovered = std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)).init(allocator),
         };
         return self;
+    }
+
+    /// Replace the cached ConfState payload for `group_id` (owned dup; frees the
+    /// prior one). Shared by the append stream + replay scan.
+    fn putConfstate(cache: *std.AutoHashMap(u64, []u8), allocator: std.mem.Allocator, group_id: u64, payload: []const u8) !void {
+        const dup = try allocator.dupe(u8, payload);
+        const gop = cache.getOrPut(group_id) catch {
+            allocator.free(dup);
+            return error.OutOfMemory;
+        };
+        if (gop.found_existing) allocator.free(gop.value_ptr.*);
+        gop.value_ptr.* = dup;
+    }
+
+    fn freeConfstateCache(allocator: std.mem.Allocator, cache: *std.AutoHashMap(u64, []u8)) void {
+        var it = cache.iterator();
+        while (it.next()) |e| allocator.free(e.value_ptr.*);
+        cache.deinit();
     }
 
     /// Crash-recovery start with the default segment size.
@@ -272,6 +297,8 @@ pub const SharedWal = struct {
         errdefer hardstate_cache.deinit();
         var compaction_cache = std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8).init(allocator);
         errdefer compaction_cache.deinit();
+        var confstate_cache = std.AutoHashMap(u64, []u8).init(allocator);
+        errdefer freeConfstateCache(allocator, &confstate_cache);
 
         const seg_nos = try discoverSealedSegments(allocator, wal_path);
         defer allocator.free(seg_nos);
@@ -287,7 +314,7 @@ pub const SharedWal = struct {
             const p = try sealedSegmentPath(&pbuf, wal_path, sn);
             const f = try std.fs.cwd().openFile(p, .{});
             defer f.close();
-            _ = try scanForReplay(allocator, f, &recovered, &gm, &hardstate_cache, &compaction_cache);
+            _ = try scanForReplay(allocator, f, &recovered, &gm, &hardstate_cache, &compaction_cache, &confstate_cache);
             try sealed.append(allocator, .{ .seg_no = sn, .group_max = gm });
             if (sn > max_seg_no) max_seg_no = sn;
         }
@@ -295,7 +322,7 @@ pub const SharedWal = struct {
         // The active segment is the only one that can have a torn tail.
         const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = false, .read = true });
         errdefer file.close();
-        const valid_end = try scanForReplay(allocator, file, &recovered, &active_group_max, &hardstate_cache, &compaction_cache);
+        const valid_end = try scanForReplay(allocator, file, &recovered, &active_group_max, &hardstate_cache, &compaction_cache, &confstate_cache);
         try file.setEndPos(valid_end);
         try file.seekTo(valid_end);
 
@@ -315,6 +342,7 @@ pub const SharedWal = struct {
             .active_group_max = active_group_max,
             .hardstate_cache = hardstate_cache,
             .compaction_cache = compaction_cache,
+            .confstate_cache = confstate_cache,
             .compaction = std.AutoHashMap(u64, u64).init(allocator),
             .recovered = recovered,
         };
@@ -330,6 +358,7 @@ pub const SharedWal = struct {
         self.active_group_max.deinit();
         self.hardstate_cache.deinit();
         self.compaction_cache.deinit();
+        freeConfstateCache(a, &self.confstate_cache);
         self.compaction.deinit();
         a.free(self.wal_path);
         a.destroy(self);
@@ -383,7 +412,7 @@ pub const SharedWal = struct {
                 @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
                 try self.compaction_cache.put(group_id, cp);
             },
-            .confstate => {},
+            .confstate => try putConfstate(&self.confstate_cache, self.allocator, group_id, payload),
         }
 
         return self.writeFramed(group_id, tag, payload);
@@ -446,6 +475,10 @@ pub const SharedWal = struct {
         var cit = self.compaction_cache.iterator();
         while (cit.next()) |e| {
             _ = try self.writeFramed(e.key_ptr.*, .compaction, e.value_ptr.*[0..]);
+        }
+        var csit = self.confstate_cache.iterator();
+        while (csit.next()) |e| {
+            _ = try self.writeFramed(e.key_ptr.*, .confstate, e.value_ptr.*);
         }
     }
 
@@ -573,6 +606,7 @@ fn scanForReplay(
     group_max: *std.AutoHashMap(u64, u64),
     hardstate_cache: *std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8),
     compaction_cache: *std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8),
+    confstate_cache: *std.AutoHashMap(u64, []u8),
 ) !u64 {
     var off: u64 = 0;
     var header: [HEADER_LEN]u8 = undefined;
@@ -623,7 +657,7 @@ fn scanForReplay(
                 @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
                 try compaction_cache.put(group_id, cp);
             },
-            .confstate => {},
+            .confstate => try SharedWal.putConfstate(confstate_cache, allocator, group_id, payload),
         }
 
         const gop = try recovered.getOrPut(group_id);
@@ -777,7 +811,16 @@ pub const GroupedFileStorage = struct {
                 },
                 .hardstate => self.replayHardState(try parseHardStatePayload(r.payload)),
                 .compaction => {}, // consumed in the pre-pass
-                .confstate => {}, // not produced today
+                .confstate => {
+                    // Records are in file order → applying each in turn leaves
+                    // the LATEST membership (last-wins), so a restarted group
+                    // comes back with its current voters/learners.
+                    if (decodeConfState(self.allocator, r.payload)) |dc| {
+                        defer self.allocator.free(dc.voters);
+                        defer self.allocator.free(dc.learners);
+                        self.mem.setConfState(dc.voters, dc.learners) catch {};
+                    } else |_| {}
+                },
             };
         }
         return self;
@@ -1030,6 +1073,56 @@ fn applySnapshotCb(
     return mem_storage.vtable.apply_snapshot.?(self.mem, data, data_len, meta_index, meta_term);
 }
 
+/// ConfState WAL-record payload: `[voters_len:u32][voters…][learners_len:u32][learners…]`
+/// (u64 LE each). Only voters + learners — single conf-changes are non-joint.
+fn encodeConfState(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), cs: *const c.RaftConfStateFfi) !void {
+    var w = buf.writer(allocator);
+    try w.writeInt(u32, @intCast(cs.voters_len), .little);
+    var i: usize = 0;
+    while (i < cs.voters_len) : (i += 1) try w.writeInt(u64, cs.voters[i], .little);
+    try w.writeInt(u32, @intCast(cs.learners_len), .little);
+    i = 0;
+    while (i < cs.learners_len) : (i += 1) try w.writeInt(u64, cs.learners[i], .little);
+}
+
+/// Decode an `encodeConfState` payload into voters + learners (slices into the
+/// caller-provided scratch, which must outlive their use). Returns error on a
+/// malformed payload (post-CRC, so defensive).
+const DecodedConfState = struct { voters: []u64, learners: []u64 };
+fn decodeConfState(allocator: std.mem.Allocator, payload: []const u8) !DecodedConfState {
+    if (payload.len < 4) return error.TruncatedConfState;
+    var off: usize = 0;
+    const vn = std.mem.readInt(u32, payload[0..4], .little);
+    off = 4;
+    if (off + @as(usize, vn) * 8 + 4 > payload.len) return error.TruncatedConfState;
+    const voters = try allocator.alloc(u64, vn);
+    errdefer allocator.free(voters);
+    for (voters) |*v| {
+        v.* = std.mem.readInt(u64, payload[off..][0..8], .little);
+        off += 8;
+    }
+    const ln = std.mem.readInt(u32, payload[off..][0..4], .little);
+    off += 4;
+    if (off + @as(usize, ln) * 8 > payload.len) return error.TruncatedConfState;
+    const learners = try allocator.alloc(u64, ln);
+    for (learners) |*l| {
+        l.* = std.mem.readInt(u64, payload[off..][0..8], .little);
+        off += 8;
+    }
+    return .{ .voters = voters, .learners = learners };
+}
+
+fn setConfStateCb(ud: ?*anyopaque, cs: [*c]const c.RaftConfStateFfi) callconv(.c) i32 {
+    const self: *GroupedFileStorage = @ptrCast(@alignCast(ud.?));
+    // Persist the membership as a confstate WAL record (re-emitted into each new
+    // segment by the SharedWal, so it survives GC) + update the in-mem view.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(self.allocator);
+    encodeConfState(self.allocator, &buf, cs) catch return -1;
+    _ = self.wal.appendRecord(self.group_id, .confstate, buf.items) catch return -1;
+    return mem_storage.vtable.set_conf_state.?(self.mem, @ptrCast(cs));
+}
+
 pub const vtable: c.RaftStorageVTable = .{
     .initial_state = initialStateCb,
     .entries = entriesCb,
@@ -1040,6 +1133,7 @@ pub const vtable: c.RaftStorageVTable = .{
     .append_entries = appendEntriesCb,
     .set_hard_state = setHardStateCb,
     .apply_snapshot = applySnapshotCb,
+    .set_conf_state = setConfStateCb,
     .destroy = destroyCb,
 };
 
@@ -1357,6 +1451,46 @@ test "recovery: open rebuilds per-group log + hardstate from a written WAL" {
     var b3 = [_]c.RaftEntryFfi{fakeEntry(1, 3, "c")};
     try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b3, 1));
     try testing.expectEqual(@as(u64, 3), g1.mem.lastIndex());
+}
+
+test "recovery: a confstate record restores membership (demote) after reopen" {
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        // Group born with all three as voters.
+        const g = try GroupedFileStorage.init(testing.allocator, &.{ 1, 2, 3 }, wal, 7);
+        defer g.deinit();
+        // Demote node 3 → learner: voters {1,2}, learners {3}.
+        var voters = [_]u64{ 1, 2 };
+        var learners = [_]u64{3};
+        const cs: c.RaftConfStateFfi = .{
+            .voters = &voters,
+            .voters_len = 2,
+            .learners = &learners,
+            .learners_len = 1,
+            .voters_outgoing = null,
+            .voters_outgoing_len = 0,
+            .learners_next = null,
+            .learners_next_len = 0,
+            .auto_leave = false,
+        };
+        try testing.expectEqual(@as(i32, 0), setConfStateCb(g, &cs));
+        try testing.expectEqualSlices(u64, &.{ 1, 2 }, g.mem.voters.items);
+        try testing.expectEqualSlices(u64, &.{3}, g.mem.learners.items);
+        try wal.flush();
+    }
+
+    // Reopen: the static init voter set {1,2,3} is OVERRIDDEN by the replayed
+    // confstate record → membership comes back as the post-demote {1,2}/{3}.
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.initRecover(testing.allocator, &.{ 1, 2, 3 }, wal, 7);
+    defer g.deinit();
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, g.mem.voters.items);
+    try testing.expectEqualSlices(u64, &.{3}, g.mem.learners.items);
 }
 
 test "recovery: a torn (CRC-failed) tail record is dropped and truncated" {
