@@ -1186,7 +1186,8 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     // snapshot's application bytes locally (see `raft_manager_pending_snapshot`
     // — the pump defers `process_ready` until then), so the `apply_snapshot`
     // hook installs them synchronously + durably here.
-    if !ready.snapshot().is_empty() {
+    let had_snapshot = !ready.snapshot().is_empty();
+    if had_snapshot {
         let snap = ready.snapshot();
         let idx = snap.get_metadata().index;
         let term = snap.get_metadata().term;
@@ -1269,6 +1270,19 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     apply_committed(group_id, ready.take_committed_entries(), cb, userdata);
 
     slot.node.advance_append_async(ready);
+    if had_snapshot {
+        // A snapshot is installed SYNCHRONOUSLY + durably by the apply handler
+        // (the kvexp `durabilize(idx)` is an fsync'd LMDB commit), unlike async
+        // entry appends. Mark this ready persisted now so `advance_apply` —
+        // which jumps `applied` to the snapshot index (`commit_since_index`) —
+        // does not run ahead of the persisted watermark and trip raft-rs's
+        // `applied <= persisted` invariant. `on_persist_ready` pops this
+        // record and advances persisted to the snapshot index; the post-fsync
+        // `raft_manager_on_persist` then no-ops it. The persistence-asserting
+        // messages (the snapshot ack) still ride the normal post-fsync release
+        // via `pending_persist` below.
+        slot.node.on_persist_ready(ready_number);
+    }
     slot.node.advance_apply();
 
     // (The old sync flow's LightReady commit-index persistence is
