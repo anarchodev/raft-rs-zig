@@ -934,6 +934,27 @@ pub const GroupedFileStorage = struct {
         try self.wal.noteCompaction(self.group_id, index);
     }
 
+    /// Install a DATA-FREE snapshot baseline at {index, term} (conf_change
+    /// promote-back). Unlike `compact` (which truncates WITHIN the existing
+    /// log), this fast-forwards the sentinel PAST the stale tail — a below-floor
+    /// learner whose last index is < `index` jumps its raft log baseline to
+    /// `index` so the leader can then replicate the tail (> index) from its log.
+    /// The KV state for `index` arrives out-of-band (the move bundle) before
+    /// this runs; only the log baseline moves. A compaction marker is persisted
+    /// so recovery anchors the sentinel here (all stale entries ≤ index are
+    /// skipped on replay). Same WAL-marker shape as `compact`.
+    pub fn applyLocalSnapshot(self: *GroupedFileStorage, index: u64, term: u64) !void {
+        try self.mem.resetToSnapshot(index, term);
+        self.entry_offsets.clearRetainingCapacity();
+        try self.entry_offsets.append(self.allocator, 0); // sentinel slot
+        self.compaction_index = index;
+        var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
+        std.mem.writeInt(u64, cp[0..8], index, .little);
+        std.mem.writeInt(u64, cp[8..16], term, .little);
+        _ = try self.wal.appendRecord(self.group_id, .compaction, &cp);
+        try self.wal.noteCompaction(self.group_id, index);
+    }
+
     fn writeEntryRecord(self: *GroupedFileStorage, e: c.RaftEntryFfi) !u64 {
         self.scratch.clearRetainingCapacity();
         const w = self.scratch.writer(self.allocator);
@@ -1069,8 +1090,13 @@ fn applySnapshotCb(
     meta_index: u64,
     meta_term: u64,
 ) callconv(.c) i32 {
+    // Data-free: KV state arrives out-of-band (the move bundle); this only
+    // moves the durable LOG baseline + persists a compaction marker.
+    _ = data;
+    _ = data_len;
     const self: *GroupedFileStorage = @ptrCast(@alignCast(ud.?));
-    return mem_storage.vtable.apply_snapshot.?(self.mem, data, data_len, meta_index, meta_term);
+    self.applyLocalSnapshot(meta_index, meta_term) catch return -1;
+    return 0;
 }
 
 /// ConfState WAL-record payload: `[voters_len:u32][voters…][learners_len:u32][learners…]`

@@ -334,12 +334,15 @@ fn applySnapshotCb(
     meta_index: u64,
     meta_term: u64,
 ) callconv(.c) i32 {
-    _ = ud;
+    // Data-free snapshot: rove carries the KV state out-of-band (the move
+    // bundle), so the snapshot only fast-forwards the raft LOG baseline. Used
+    // by conf_change promote-back (a below-floor learner rejoins). Reset the
+    // in-memory log to a lone sentinel at {index, term}.
     _ = data;
     _ = data_len;
-    _ = meta_index;
-    _ = meta_term;
-    return 0; // stub — rove does not use raft's in-protocol snapshot transport
+    const self: *MemStorage = @ptrCast(@alignCast(ud.?));
+    self.resetToSnapshot(meta_index, meta_term) catch return -1;
+    return 0;
 }
 
 pub const vtable: c.RaftStorageVTable = .{

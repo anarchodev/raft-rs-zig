@@ -105,6 +105,9 @@ pub const Error = error{
     /// commit from it. (Backstop for raft-rs 0.7's unconditional
     /// follower proposal forwarding; see raft_manager_propose.)
     NotLeader,
+    /// A local-snapshot baseline install was refused because the requested
+    /// index is not ahead of the group's committed index (nothing to install).
+    SnapshotStale,
     ProcessReadyFailed,
     TakeMessagesFailed,
     StepFailed,
@@ -342,6 +345,23 @@ pub const Manager = struct {
         const count = @min(n, cap);
         for (0..count) |i| out[i] = .{ .id = ids_buf[i], .matched = matched_buf[i], .recent_active = active_buf[i] != 0 };
         return .{ .peers = out[0..count], .leader_last = leader_last };
+    }
+
+    /// Install a data-free snapshot baseline at {index, term} into a LOCAL group
+    /// (conf_change promote-back). The node must be a below-floor learner; the
+    /// KV state for `index` must already be loaded out-of-band (the move
+    /// bundle). Fast-forwards the raft log baseline so the leader can replicate
+    /// the tail and the node can be promoted back. Pump-thread only.
+    /// `Error.NotLeader` if this node leads the group (a leader can't restore to
+    /// itself); `Error.SnapshotStale` if `index` is not ahead of committed.
+    pub fn applyLocalSnapshot(self: *Manager, group_id: u64, index: u64, term: u64) Error!void {
+        const rc = c.raft_manager_apply_local_snapshot(self.ptr, group_id, index, term);
+        return switch (rc) {
+            0 => {},
+            -2 => Error.NotLeader,
+            -3 => Error.SnapshotStale,
+            else => Error.ProposeFailed,
+        };
     }
 
     /// Propose an entry to `group_id`. Returns when the entry is

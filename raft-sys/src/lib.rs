@@ -1029,6 +1029,69 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
     0
 }
 
+/// Install a DATA-FREE snapshot baseline at {index, term} into `group_id`'s
+/// LOCAL raft log (conf_change Phase 2 promote-back). The node must be a
+/// learner/follower that has fallen below the leader's compacted log floor — it
+/// can no longer catch up by replication and rove has no in-protocol snapshot
+/// transport. The KV state for `index` is delivered out-of-band (the move
+/// bundle) BEFORE this call; this only fast-forwards the raft LOG baseline so
+/// the leader can then replicate the tail (> index) from its log and the node
+/// can be promoted back to a voter. Steps a self-addressed `MsgSnapshot`
+/// carrying the group's CURRENT membership, so applying it is membership-neutral
+/// (the promote is a separate conf-change); `process_ready` installs it via the
+/// `apply_snapshot` storage callback. Returns 0; -1 unknown group; -2 leader (a
+/// leader cannot restore a snapshot to itself); -3 index not ahead of the
+/// committed index (nothing to install); -4 step error.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
+    m: *mut RaftManager,
+    group_id: u64,
+    index: u64,
+    term: u64,
+) -> i32 {
+    let mgr = &mut *m;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state == StateRole::Leader {
+        return -2;
+    }
+    if index <= slot.node.raft.raft_log.committed {
+        return -3;
+    }
+    let self_id = slot.node.raft.id;
+    let cur_term = slot.node.raft.term;
+    // Stamp the group's CURRENT membership so `restore` finds this node a member
+    // and the apply is membership-neutral (promote-back is a later conf-change).
+    let mut cs = ConfState::default();
+    {
+        let prs = slot.node.raft.prs();
+        cs.set_voters(prs.conf().voters().ids().iter().collect());
+        cs.set_learners(prs.conf().learners().iter().copied().collect());
+    }
+    let mut meta = SnapshotMetadata::default();
+    meta.set_index(index);
+    meta.set_term(term);
+    meta.set_conf_state(cs);
+    let mut snap = Snapshot::default();
+    snap.set_metadata(meta);
+    // data left empty — the KV state arrived out-of-band (the move bundle).
+    let mut msg = Message::default();
+    msg.set_msg_type(MessageType::MsgSnapshot);
+    msg.set_to(self_id);
+    msg.set_from(self_id);
+    msg.set_term(cur_term);
+    msg.set_snapshot(snap);
+    match slot.node.step(msg) {
+        Ok(()) => {
+            notify_locked(&slot.state, &mgr.pending, group_id);
+            0
+        }
+        Err(_) => -4,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,
@@ -1285,6 +1348,27 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     let mut ready = slot.node.ready();
     let ready_number = ready.number();
 
+    // Install a snapshot FIRST — before hard state + entries — so the log
+    // baseline resets before any commit index referring to it is persisted.
+    // rove's snapshots are DATA-FREE (the KV state arrives out-of-band via the
+    // move bundle); the `apply_snapshot` storage callback only fast-forwards
+    // the LOG baseline to the snapshot index. The sole producer is
+    // `raft_manager_apply_local_snapshot` (conf_change promote-back: a
+    // below-floor learner jumps its log to a current index so the leader can
+    // replicate the tail and it can be promoted back to a voter).
+    let had_snapshot = !ready.snapshot().is_empty();
+    if had_snapshot {
+        let snap = ready.snapshot();
+        let idx = snap.get_metadata().index;
+        let term = snap.get_metadata().term;
+        let data = snap.get_data();
+        if let Some(apply_snap) = (*vtable_ptr).apply_snapshot {
+            if apply_snap(store_userdata, data.as_ptr(), data.len(), idx, term) != 0 {
+                return -4;
+            }
+        }
+    }
+
     // Persist hard state.
     if let Some(hs) = ready.hs() {
         if let Some(set_hs) = (*vtable_ptr).set_hard_state {
@@ -1375,6 +1459,15 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     }
 
     slot.node.advance_append_async(ready);
+    if had_snapshot {
+        // A snapshot makes `advance_apply` jump `applied` to the snapshot index;
+        // raft asserts `applied <= persisted`, so mark this ready persisted now
+        // (the data-free baseline + compaction marker are installed
+        // synchronously by the apply handler above). The number also rides
+        // `pending_persist` below, so the post-fsync `on_persist` re-acks it
+        // idempotently along with this ready's persistence-asserting messages.
+        slot.node.on_persist_ready(ready_number);
+    }
     slot.node.advance_apply();
 
     // Apply membership changes durably (slot.node is free now). For each
