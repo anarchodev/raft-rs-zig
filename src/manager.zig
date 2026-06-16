@@ -25,8 +25,6 @@ pub const MemStorage = storage_mod.MemStorage;
 pub const FileStorage = file_storage_mod.FileStorage;
 pub const SharedWal = grouped_file_storage_mod.SharedWal;
 pub const GroupedFileStorage = grouped_file_storage_mod.GroupedFileStorage;
-pub const SnapshotProviderFn = grouped_file_storage_mod.SnapshotProviderFn;
-pub const ApplyHandlerFn = grouped_file_storage_mod.ApplyHandlerFn;
 /// Re-export of the C-ABI storage vtable type so consumers can
 /// pass it around (as `*const StorageVTable`) without their own
 /// `@cImport` of `raft_sys.h`.
@@ -252,28 +250,6 @@ pub const Manager = struct {
     /// *lowered* by it. Pump-thread only (reads the Manager).
     pub fn minMatchIndex(self: *const Manager, group_id: u64) u64 {
         return c.raft_manager_min_match_index(self.ptr, group_id);
-    }
-
-    /// Descriptor of a snapshot pending application on `group_id` (received
-    /// from the leader, not yet installed). The `data` slice is borrowed and
-    /// valid only until the next Manager mutation — copy it immediately.
-    pub const PendingSnapshot = struct { data: []const u8, index: u64, term: u64 };
-
-    /// If `group_id` has a pending snapshot, return its descriptor; null if
-    /// none / unknown group. Used by the pump to stage the snapshot's bytes
-    /// locally before letting `processReady` apply it synchronously.
-    pub fn pendingSnapshot(self: *const Manager, group_id: u64) ?PendingSnapshot {
-        var data: [*c]const u8 = null;
-        var len: usize = 0;
-        var index: u64 = 0;
-        var term: u64 = 0;
-        const rc = c.raft_manager_pending_snapshot(self.ptr, group_id, &data, &len, &index, &term);
-        if (rc != 1) return null;
-        return .{
-            .data = if (len > 0) data[0..len] else &.{},
-            .index = index,
-            .term = term,
-        };
     }
 
     /// Propose an entry to `group_id`. Returns when the entry is

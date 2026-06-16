@@ -314,20 +314,12 @@ fn applySnapshotCb(
     meta_index: u64,
     meta_term: u64,
 ) callconv(.c) i32 {
-    const self: *MemStorage = @ptrCast(@alignCast(ud.?));
-    // `data` is the application's snapshot payload (in rove: a descriptor
-    // pointing at the tenant bundle) — installed by the application's apply
-    // handler at the GroupedFileStorage layer, NOT here. MemStorage owns only
-    // the raft *log*: reset it to the snapshot point and advance the durable
-    // hardstate, mirroring raft-rs's reference MemStorage::apply_snapshot.
+    _ = ud;
     _ = data;
     _ = data_len;
-    // Reject a stale snapshot (we already hold state at/after this index).
-    if (meta_index < self.entries.items[0].index) return -2;
-    self.resetToSnapshot(meta_index, meta_term) catch return -1;
-    self.hs_commit = meta_index;
-    if (meta_term > self.hs_term) self.hs_term = meta_term;
-    return 0;
+    _ = meta_index;
+    _ = meta_term;
+    return 0; // stub — rove does not use raft's in-protocol snapshot transport
 }
 
 pub const vtable: c.RaftStorageVTable = .{

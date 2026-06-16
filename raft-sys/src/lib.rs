@@ -304,15 +304,6 @@ impl Storage for FfiStorage {
         let mut meta = SnapshotMetadata::default();
         meta.set_index(meta_index);
         meta.set_term(meta_term);
-        // A snapshot MUST carry the membership as-of its index, or the
-        // receiving follower restores an empty voter set. Source it from the
-        // storage's persisted RaftState (`initial_state`). Membership is fixed
-        // in the current scope (no conf_change), so the live conf_state is
-        // correct for any index; when conf_change lands, this must be the
-        // conf_state as-of `meta_index`.
-        if let Ok(rs) = self.initial_state() {
-            meta.set_conf_state(rs.conf_state);
-        }
         snap.set_metadata(meta);
         Ok(snap)
     }
@@ -886,43 +877,6 @@ pub unsafe extern "C" fn raft_manager_min_match_index(
     min_matched
 }
 
-/// If `group_id` has a snapshot pending application (received from the leader
-/// via `MsgSnapshot`, staged in raft's unstable log but not yet installed),
-/// fill its descriptor bytes + index + term and return 1. Returns 0 if there
-/// is no pending snapshot, -1 if the group is unknown. Does NOT consume a
-/// ready: the caller uses this to stage the snapshot's application state
-/// locally BEFORE letting `process_ready` apply it (the apply is synchronous,
-/// so the payload the descriptor names must already be in hand). The `out_data`
-/// pointer is valid only for the duration of THIS call — copy it before any
-/// further mutation of the group.
-#[no_mangle]
-pub unsafe extern "C" fn raft_manager_pending_snapshot(
-    m: *const RaftManager,
-    group_id: u64,
-    out_data: *mut *const u8,
-    out_data_len: *mut usize,
-    out_index: *mut u64,
-    out_term: *mut u64,
-) -> i32 {
-    let mgr = &*m;
-    let slot = match mgr.groups.get(&group_id) {
-        Some(s) => s,
-        None => return -1,
-    };
-    match slot.node.snap() {
-        Some(snap) if !snap.is_empty() => {
-            let data = snap.get_data();
-            *out_data = data.as_ptr();
-            *out_data_len = data.len();
-            let meta = snap.get_metadata();
-            *out_index = meta.index;
-            *out_term = meta.term;
-            1
-        }
-        _ => 0,
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,
@@ -1179,26 +1133,6 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     let mut ready = slot.node.ready();
     let ready_number = ready.number();
 
-    // Apply an inbound snapshot FIRST — before hard state and entries. It
-    // resets the log to the snapshot index; persisting a hard state with
-    // commit = snapshot_index while the state machine does not yet hold that
-    // snapshot would be corrupt on a crash. The caller has already staged the
-    // snapshot's application bytes locally (see `raft_manager_pending_snapshot`
-    // — the pump defers `process_ready` until then), so the `apply_snapshot`
-    // hook installs them synchronously + durably here.
-    let had_snapshot = !ready.snapshot().is_empty();
-    if had_snapshot {
-        let snap = ready.snapshot();
-        let idx = snap.get_metadata().index;
-        let term = snap.get_metadata().term;
-        let data = snap.get_data();
-        if let Some(apply_snap) = (*vtable_ptr).apply_snapshot {
-            if apply_snap(store_userdata, data.as_ptr(), data.len(), idx, term) != 0 {
-                return -4;
-            }
-        }
-    }
-
     // Persist hard state.
     if let Some(hs) = ready.hs() {
         if let Some(set_hs) = (*vtable_ptr).set_hard_state {
@@ -1270,19 +1204,6 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     apply_committed(group_id, ready.take_committed_entries(), cb, userdata);
 
     slot.node.advance_append_async(ready);
-    if had_snapshot {
-        // A snapshot is installed SYNCHRONOUSLY + durably by the apply handler
-        // (the kvexp `durabilize(idx)` is an fsync'd LMDB commit), unlike async
-        // entry appends. Mark this ready persisted now so `advance_apply` —
-        // which jumps `applied` to the snapshot index (`commit_since_index`) —
-        // does not run ahead of the persisted watermark and trip raft-rs's
-        // `applied <= persisted` invariant. `on_persist_ready` pops this
-        // record and advances persisted to the snapshot index; the post-fsync
-        // `raft_manager_on_persist` then no-ops it. The persistence-asserting
-        // messages (the snapshot ack) still ride the normal post-fsync release
-        // via `pending_persist` below.
-        slot.node.on_persist_ready(ready_number);
-    }
     slot.node.advance_apply();
 
     // (The old sync flow's LightReady commit-index persistence is
