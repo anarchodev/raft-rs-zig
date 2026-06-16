@@ -978,6 +978,57 @@ pub unsafe extern "C" fn raft_manager_conf_state(
     0
 }
 
+/// Per-*peer*-voter replication progress on the LEADER of `group_id`, for the
+/// leader-side auto-demote policy. Writes one entry per voter OTHER than self
+/// into the three parallel caller buffers: node id, `matched` index, and
+/// `recent_active` (1 = the leader has heard from this voter within the last
+/// election timeout under check_quorum, 0 = presumed dead/partitioned). Self is
+/// excluded (the leader never demotes itself); learners are excluded (they do
+/// not gate the compaction floor). `*out_len` is set to the true peer-voter
+/// count even if it exceeds `cap`, so the caller can detect truncation;
+/// `*out_leader_last` receives the leader's own last log index so the caller
+/// computes each peer's lag as `leader_last - matched`. Returns 0 on success,
+/// -1 unknown group, -2 not leader. Read-only — no notify.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_voter_progress(
+    m: *const RaftManager,
+    group_id: u64,
+    out_ids: *mut u64,
+    out_matched: *mut u64,
+    out_recent_active: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+    out_leader_last: *mut u64,
+) -> i32 {
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state != StateRole::Leader {
+        return -2;
+    }
+    let self_id = slot.node.raft.id;
+    *out_leader_last = slot.node.raft.raft_log.last_index();
+    let prs = slot.node.raft.prs();
+    let voters = prs.conf().voters();
+    let mut n = 0usize;
+    for (id, pr) in prs.iter() {
+        let id = *id;
+        if id == self_id || !voters.contains(id) {
+            continue; // peer voters only — never self, never a learner
+        }
+        if n < cap {
+            *out_ids.add(n) = id;
+            *out_matched.add(n) = pr.matched;
+            *out_recent_active.add(n) = u8::from(pr.recent_active);
+        }
+        n += 1;
+    }
+    *out_len = n;
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_propose(
     m: *mut RaftManager,

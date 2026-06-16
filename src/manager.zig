@@ -304,6 +304,46 @@ pub const Manager = struct {
         };
     }
 
+    /// One peer voter's replication progress on the leader (auto-demote input).
+    pub const VoterProgress = struct { id: u64, matched: u64, recent_active: bool };
+    pub const VoterProgressView = struct {
+        /// Peer voters (self excluded), truncated to the caller's buffers.
+        peers: []const VoterProgress,
+        /// The leader's own last log index; `peer.lag = leader_last - matched`.
+        leader_last: u64,
+    };
+
+    /// Snapshot each peer voter's `matched` + `recent_active` on `group_id`'s
+    /// leader, plus the leader's last log index, into the caller's parallel
+    /// buffers (which must be the same length; the view's `peers` is truncated
+    /// to that length). Null on a follower / unknown group. Pump-thread only.
+    pub fn voterProgress(
+        self: *const Manager,
+        group_id: u64,
+        ids_buf: []u64,
+        matched_buf: []u64,
+        active_buf: []u8,
+        out: []VoterProgress,
+    ) ?VoterProgressView {
+        var n: usize = 0;
+        var leader_last: u64 = 0;
+        const cap = @min(@min(ids_buf.len, matched_buf.len), @min(active_buf.len, out.len));
+        const rc = c.raft_manager_voter_progress(
+            self.ptr,
+            group_id,
+            ids_buf.ptr,
+            matched_buf.ptr,
+            active_buf.ptr,
+            cap,
+            &n,
+            &leader_last,
+        );
+        if (rc != 0) return null;
+        const count = @min(n, cap);
+        for (0..count) |i| out[i] = .{ .id = ids_buf[i], .matched = matched_buf[i], .recent_active = active_buf[i] != 0 };
+        return .{ .peers = out[0..count], .leader_last = leader_last };
+    }
+
     /// Propose an entry to `group_id`. Returns when the entry is
     /// in raft-rs's pending list, NOT when it's applied —
     /// application happens via `processReady` after the entry
