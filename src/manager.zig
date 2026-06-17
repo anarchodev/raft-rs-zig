@@ -108,6 +108,10 @@ pub const Error = error{
     /// A local-snapshot baseline install was refused because the requested
     /// index is not ahead of the group's committed index (nothing to install).
     SnapshotStale,
+    /// A local-snapshot baseline was malformed: index 0, or term 0 for an
+    /// index>0 (a term-0 baseline crashes raft's restore — rejected both at this
+    /// wrapper and in the FFI engine, code -5).
+    InvalidBaseline,
     ProcessReadyFailed,
     TakeMessagesFailed,
     StepFailed,
@@ -284,6 +288,7 @@ pub const Manager = struct {
         const rc = c.raft_manager_propose_conf_change(self.ptr, group_id, node, @intFromEnum(change));
         return switch (rc) {
             0 => {},
+            -1 => Error.UnknownGroup, // the bhs-3 id-drift signal — must NOT look like a transient ProposeFailed
             -2 => Error.NotLeader,
             -4 => Error.ConfChangeQuorumGuard,
             else => Error.ProposeFailed,
@@ -309,6 +314,11 @@ pub const Manager = struct {
             &ln,
         );
         if (rc != 0) return null;
+        // The FFI reports the TRUE count even past the cap so truncation is
+        // detectable; surface it loudly rather than silently returning a short
+        // (wrong) membership view that a reconciler would compare against desired.
+        if (vn > voters_buf.len or ln > learners_buf.len)
+            std.log.err("raft confState(group {d}): membership exceeds buffer ({d} voters/{d} learners vs {d}/{d}) — view INCOMPLETE", .{ group_id, vn, ln, voters_buf.len, learners_buf.len });
         return .{
             .voters = voters_buf[0..@min(vn, voters_buf.len)],
             .learners = learners_buf[0..@min(ln, learners_buf.len)],
@@ -350,6 +360,10 @@ pub const Manager = struct {
             &leader_last,
         );
         if (rc != 0) return null;
+        // Truncation must not be silent: an omitted live voter is invisible to the
+        // auto-demote policy. The FFI reports the true count past the cap so log it.
+        if (n > cap)
+            std.log.err("raft voterProgress(group {d}): {d} peer voters exceed buffer cap {d} — view INCOMPLETE (a live voter is hidden from the policy)", .{ group_id, n, cap });
         const count = @min(n, cap);
         for (0..count) |i| out[i] = .{ .id = ids_buf[i], .matched = matched_buf[i], .recent_active = active_buf[i] != 0 };
         return .{ .peers = out[0..count], .leader_last = leader_last };
@@ -370,11 +384,17 @@ pub const Manager = struct {
     /// `Error.NotLeader` if this node leads the group (a leader can't restore to
     /// itself); `Error.SnapshotStale` if `index` is not ahead of committed.
     pub fn applyLocalSnapshot(self: *Manager, group_id: u64, index: u64, term: u64) Error!void {
+        // Second gate (the FFI engine is the first): a baseline must be a real
+        // {index>0, term>0} pair. A {0,_} or {n,0} baseline is meaningless and a
+        // term-0 baseline crashes raft's restore — reject loudly here.
+        if (index == 0 or term == 0) return Error.InvalidBaseline;
         const rc = c.raft_manager_apply_local_snapshot(self.ptr, group_id, index, term);
         return switch (rc) {
             0 => {},
+            -1 => Error.UnknownGroup,
             -2 => Error.NotLeader,
             -3 => Error.SnapshotStale,
+            -5 => Error.InvalidBaseline, // engine rejected a term-0 baseline
             else => Error.ProposeFailed,
         };
     }
@@ -497,6 +517,7 @@ pub const Manager = struct {
         const rc = c.raft_manager_step(self.ptr, group_id, msg_bytes.ptr, msg_bytes.len);
         return switch (rc) {
             0 => {},
+            -1 => Error.UnknownGroup, // distinct from a step rejection — id drift / post-destroy race
             -2 => Error.StepDecodeFailed,
             else => Error.StepFailed,
         };
@@ -519,6 +540,7 @@ pub const Manager = struct {
         const rc = c.raft_manager_step_fenced(self.ptr, group_id, sender_epoch, msg_bytes.ptr, msg_bytes.len);
         return switch (rc) {
             0 => {},
+            -1 => Error.UnknownGroup,
             -2 => Error.StepDecodeFailed,
             -4 => Error.StepFenced,
             else => Error.StepFailed,

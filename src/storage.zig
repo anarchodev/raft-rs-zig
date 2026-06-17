@@ -321,7 +321,13 @@ fn appendEntriesCb(
     const self: *MemStorage = @ptrCast(@alignCast(ud.?));
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        self.appendOne(entries[i]) catch return -1;
+        self.appendOne(entries[i]) catch |e| switch (e) {
+            // A gap is an INVARIANT VIOLATION (raft never appends non-contiguous
+            // entries). Reporting it as -1/"unavailable" makes raft retry a
+            // non-appendable entry forever — fail fast instead of looping silently.
+            error.GapInLog => std.debug.panic("MemStorage.appendEntries: log gap at entry {d} (non-contiguous append — invariant violation)", .{i}),
+            else => return -1, // OOM etc. → genuinely unavailable
+        };
     }
     return 0;
 }
