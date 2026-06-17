@@ -25,15 +25,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const release = optimize != .Debug;
-    const profile_dir: []const u8 = if (release) "release" else "debug";
+    // Build the Rust raft-sys staticlib OPTIMIZED regardless of the Zig optimize
+    // mode. A debug (`-O0`) Rust build emits 16-byte SIMD constants
+    // (`.rodata.cst16`) with only 8-byte alignment while still issuing `movaps`
+    // against them; whether the linker lands such a constant on a 16-aligned
+    // address is pure binary layout, so an unrelated dependency/code change can
+    // flip it and #GP the threaded host inside `confchange::restore` (the
+    // e2c4aea GPF — root-caused via gdb in
+    // docs/BUG-e2c4aea-process-ready-confchange-gpf.md). opt-level≥1 lowers the
+    // intrinsic to a single `pmovmskb` with no constant load, so the misaligned
+    // `movaps` never exists. Decoupled from the consumer's debug/release setting
+    // on purpose — the Zig code below still honours `optimize`.
+    const profile_dir: []const u8 = "release";
 
-    // Build the Rust raft-sys static library. Redirect cargo's output into a
-    // build-tracked directory so the produced `.a` is a LazyPath: adding it via
-    // `addObjectFile` then creates an automatic build dependency (and triggers
-    // cargo) wherever the module is used — no wrapper artifact required.
+    // Redirect cargo's output into a build-tracked directory so the produced
+    // `.a` is a LazyPath: adding it via `addObjectFile` then creates an automatic
+    // build dependency (and triggers cargo) wherever the module is used — no
+    // wrapper artifact required.
     const cargo = b.addSystemCommand(&.{ "cargo", "build" });
-    if (release) cargo.addArg("--release");
+    cargo.addArg("--release");
     cargo.addArg("--manifest-path");
     cargo.addFileArg(b.path("raft-sys/Cargo.toml"));
     const cargo_out = cargo.addPrefixedOutputDirectoryArg("--target-dir=", "cargo-target");

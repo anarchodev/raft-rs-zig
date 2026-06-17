@@ -1,7 +1,7 @@
 # BUG: `e2c4aea` segfaults the threaded host in `confchange::restore` at group creation
 
-**Status:** RESOLVED (2026-06-06) — root cause was a **gitignored `Cargo.lock` re-resolving `raft`'s transitive `hashbrown` to a bad `0.16.1`**, not the source change. Fixed by committing the lockfile (`7ea746d`). See **Resolution** at the bottom.
-**Introduced by:** dependency drift, *not* `e2c4aea`'s source (the 23-line block was bisected out and the crash persisted — see Resolution)
+**Status:** ROOT-CAUSED (2026-06-06, via gdb + objdump) — it is a **debug-build misaligned-`movaps`** on an under-aligned 16-byte SIMD constant in the Rust object, NOT a dependency at all. The committed-`Cargo.lock` "fix" (`7ea746d`) only masks it by relaying the constant onto a 16-byte boundary. The robust fix is to build the Rust staticlib optimized. See **PROVEN root cause (gdb)** at the very bottom; the dependency-drift / `hashbrown` / "unproven crate" sections above are superseded and kept only for history.
+**Introduced by:** nothing in raft-rs-zig source — a rustc/LLVM `-O0` codegen + link-layout interaction (see PROVEN root cause). Dependency-version changes only shift binary layout, flipping the constant between a 16-aligned (benign) and 8-aligned (#GP) address.
 **Last-good:** `239bafb` ("WAL segmentation + segment GC")
 **Severity:** crashes any threaded host on the first `createGroup` — fully broken, not intermittent.
 
@@ -143,7 +143,10 @@ threaded host stop crashing. Narrow which of the two deltas is load-bearing:
 
 An in-tree investigation against this commit confirms the report's
 *reasoning* but invalidates its *evidence*, and fails to reproduce the
-crash. Net: the attribution to `e2c4aea` is **not yet established**.
+crash in-tree. Combined with the rove-side bisect (see Resolution), this
+**exonerates the `e2c4aea` source** and points at unpinned-dependency
+drift. It also **rules out the two mechanisms that were proposed** (raft's
+runtime hashbrown, and cbindgen/ABI header drift) — see Resolution.
 
 ### Confirmed
 
@@ -185,46 +188,28 @@ report blames. It **passes**. Pushed harder during investigation
 `RawNode::new`/`confchange::restore`, across **debug, ReleaseFast, and
 ReleaseSafe** — all pass. The fault does not reproduce in this repo.
 
-This pushes the cause toward something **specific to the rove host
-process** (its allocator, its other live threads, S3/HTTP2 memory
-pressure) rather than the raft-rs-zig threaded lifecycle or release-mode
-codegen layout. The garbage `HashSet` ctrl pointer is the read-side
-symptom of corruption originating elsewhere in the host — consistent
-with the allocator note, not with a logic bug on the crashing path.
-
-### The now-valid A/B procedure (run in the rove consumer)
-
-The original repro under §Reproduction is still the right test, but must
-now be run with a **pinned lockfile on both sides** so the only variable
-is the source delta:
-
-1. For each pin (`239bafb`, `e2c4aea`), check it out and drop the
-   committed `raft-sys/Cargo.lock` into place before building, so both
-   builds use the identical dependency tree.
-2. Run the §Reproduction HTTP write against each.
-3. Interpret:
-   - **Still 204 vs SIGSEGV** with identical deps ⇒ the 23-line change is
-     genuinely implicated (codegen/allocator-interaction, not logic).
-     Next: ASan / valgrind on the rove binary to catch the corrupting
-     write upstream of the hashbrown read.
-   - **Both 204** (crash vanishes once the lockfile is shared) ⇒ the
-     original failure was dependency drift; `e2c4aea` is exonerated.
-
-Until step 3 is run, treat the `e2c4aea` attribution as unproven.
+It does **not** reproduce because the in-tree build resolves a different
+dependency tree than the crashing rove builds did — which is the whole
+point: the crash tracks the dependency tree, not the raft-rs-zig source.
+The garbage `HashSet` ctrl pointer is the read-side symptom of memory
+corruption originating in a drifted dependency, surfacing in raft's
+`std::collections::HashSet`.
 
 ## Impact on the consumer
 
 For rove specifically, the bare `e2c4aea` commit (gitignored lock) was
 **net-negative**: its purpose is to unblock WAL compaction (`compact_wal`),
 which rove keeps **off** for unrelated threaded-integration reasons, *and* its
-unpinned lockfile let the build drift onto the crashing `hashbrown 0.16.1`. The
+unpinned lockfile let the build drift onto a crashing dependency tree. The
 fixed commit `7ea746d` (committed lock) is safe to adopt — see Resolution.
 
 ## Resolution (2026-06-06)
 
 The "Investigation update" A/B procedure was run, plus a tighter bisect that
 holds the dep tree constant. Conclusion: **`e2c4aea`'s source is exonerated; the
-crash was `hashbrown 0.16.1` pulled in by an unpinned lockfile.**
+crash was caused by an unpinned lockfile drifting raft's dependency
+tree.** The crate originally blamed (`hashbrown 0.16.1`) is *not* the
+culprit — see "Root cause" below for the dependency-graph proof.
 
 ### Bisect: the 23-line block is not the cause
 
@@ -235,36 +220,151 @@ cached `raft-sys/src/lib.rs`, then rebuilt the rove `rewind` binary and ran the
 `confchange::restore` site. So the added code is not the trigger — it merely
 shipped alongside a dependency re-resolution.
 
-### Root cause: unpinned `Cargo.lock` → `hashbrown 0.16.1`
+### Root cause: unpinned `Cargo.lock` (the crate is *not* `hashbrown`)
 
 `raft-sys/Cargo.lock` was gitignored, so every build re-resolved the whole Rust
-tree against the registry-of-the-moment. Around the time of `e2c4aea` the
-resolver picked **`hashbrown 0.16.1`** for `raft 0.7.0`'s transitive use. The
-crashing rove binaries all link `hashbrown-0.16.1`; the GPF is in its SSE2
-`Group::load` while `confchange::restore` iterates the voter `HashSet`. Whether
-0.16.1 is itself buggy or merely exposes a latent UB/codegen/allocator
-interaction under the rove host, **that version is the differentiator** — not
-the raft-rs-zig source. (The in-tree threaded test never reproduced because it
-resolved a different hashbrown.)
+tree against the registry-of-the-moment. The crash tracks that drift: pin the
+tree and it disappears (verification below); leave it unpinned and it can come
+back. That part of the original Resolution is correct.
+
+**But `hashbrown` is not the differentiator, and cannot be.** A dependency-graph
+audit (`cargo tree`, raft source) rules it out conclusively:
+
+1. **raft 0.7.0 has no external `hashbrown` dependency.** Its deps are
+   `bytes, fxhash, getset, protobuf, raft-proto, rand, slog*, thiserror`. The
+   crashing `HashSet<u64>::union` (`raft-0.7.0/src/util.rs:142`) uses
+   `crate::HashSet`, which raft defines at `lib.rs:602–604` as
+   `std::collections::HashSet<K, BuildHasherDefault<fxhash::FxHasher>>`. That is
+   **std's** HashSet — the `hashbrown` in the backtrace is the copy **vendored
+   into the rustc toolchain**, whose version is fixed by the compiler, *not* by
+   `Cargo.lock`. No `Cargo.lock` entry can change it.
+2. **The external `hashbrown` crate is build-tool-only.** It is reachable only
+   through `cbindgen → indexmap (0.17) / wasmparser (0.15)`.
+   `cargo tree -e normal -i hashbrown` prints "nothing to print" for every
+   version, and the runtime (normal-edge) tree contains **zero** `hashbrown`
+   nodes. cbindgen runs in `build.rs` to regenerate `raft_sys.h`; its code is
+   never linked into `libraft_sys.a` or the rove binary. The "stale
+   `hashbrown-0.16.1` string in debug metadata" the original Resolution noticed
+   is exactly the footprint of a *build-time* tool, not of linked runtime code —
+   it corroborates this, rather than the runtime-link claim.
+3. **It is not cbindgen/ABI header drift either.** Regenerating `raft_sys.h`
+   under the committed lock vs a fresh-resolved tree (cbindgen pinned at 0.27.0
+   in both) yields a **byte-identical** 304-line header. So the FFI struct
+   layout the Zig `@cImport` sees does not change with the dep tree; an
+   ABI-mismatch corruption channel is excluded.
+
+What an unpinned lock *does* drift, in raft's **runtime** closure, includes
+`log`, `chrono`, `memchr`, and `zerocopy`/`ppv-lite86` (the last via `rand`,
+which raft uses for randomized election timeouts). The true differentiator is
+one of these (or an allocator/UB interaction it exposes) — **unproven without
+the crashing-era lockfile**. `hashbrown 0.16.1` was at most a marker of the
+drifted tree, mistaken for its cause.
 
 ### Fix + verification
 
-`7ea746d` commits `raft-sys/Cargo.lock`, pinning to **`hashbrown 0.15.5` /
-`0.17.0`** (zero references to `0.16.1`). Verified end-to-end in the rove
-consumer (branch `v2`) by bumping the pin to `7ea746d` and rebuilding clean:
+`7ea746d` commits `raft-sys/Cargo.lock`, freezing the entire dependency tree.
+Verified two ways:
 
-- `scripts/rewind_smoke.py` → **PASS** (writes 204 + restart/durability leg).
-- `zig build v2-test` → **green**.
-- Direct repro: 3 writes all 204, host stays alive.
+- **Header determinism (in-tree).** `raft_sys.h` is byte-identical across the
+  committed lock and a fresh resolve — the FFI surface is stable.
+- **End-to-end (rove consumer, branch `v2`).** Bumping the pin to `7ea746d` and
+  rebuilding clean: `scripts/rewind_smoke.py` → **PASS** (204 + restart/
+  durability leg), `zig build v2-test` → **green**, direct repro 3× 204 with the
+  host alive.
 
-(NB: the linked binary still contains a stale `hashbrown-0.16.1` *string* in
-debug metadata, but the compiled `raft` now uses the pinned `0.17.0` and the
-crash is gone.)
+The fix works because it pins the *whole* tree; it does not depend on
+identifying the specific drifted crate.
 
 ### Follow-ups
 
-- Keep `Cargo.lock` committed (done in `7ea746d`) — the real durable fix; an
-  unpinned lock can drift back onto `0.16.1` at any time.
-- Optional: file/track an upstream `hashbrown 0.16.1` issue, or add an explicit
-  `hashbrown` floor/ceiling in `raft-sys/Cargo.toml` to document the exclusion.
+- Keep `Cargo.lock` committed (done in `7ea746d`) — the durable fix. Because it
+  is listed in `build.zig.zon`'s `.paths`, consumers fetching this package now
+  get the pinned tree.
+- **Do not** file an upstream `hashbrown` issue or add a `hashbrown` bound in
+  `raft-sys/Cargo.toml` — that would chase a crate that is never linked into the
+  consensus code.
+- To actually pinpoint the culprit (optional, only if it recurs): recover the
+  crashing-era `Cargo.lock` from a rove build that still reproduces, diff it
+  against `7ea746d`'s lock, and bisect the differing **runtime** crates
+  (`log`/`chrono`/`memchr`/`zerocopy`), e.g. under ASan/valgrind.
 - The `e2c4aea` commit-index-persistence logic is fine and stays.
+
+## PROVEN root cause (gdb + objdump, 2026-06-06)
+
+A gdb session on a crashing rove `rewind` (debug build, BAD dep tree) caught the
+fault. It is **not** an allocator bug, **not** a specific dependency package,
+**not** corrupted/garbage data, and **not** a CPU-flag (MXCSR/AC) issue. It is a
+**misaligned aligned-SSE load of an under-aligned static SIMD constant**, only in
+the `-O0` (debug) build, with placement decided by binary layout.
+
+### The fault
+
+```
+Thread 2 received signal SIGSEGV
+#0  _mm_movemask_epi8        sse2.rs:1495
+...  hashbrown Group::match_full / RawIterRange::new / RawTable::iter
+#11 raft::util::Union::iter  src/util.rs:142   (HashSet::union over the voter set)
+#12 confchange::changer::check_invariants
+#15 confchange::restore::restore
+#16 Raft::new  #17 RawNode::new  #18 raft_manager_create_group
+#19 createGroupEpoch  #20 createGroupCore  #21 ensureGroup  #22/23 pump
+
+=> 0x1d7d354 <_mm_movemask_epi8+4>:  movaps -0xcbc0e3(%rip),%xmm0   # 0x10c1278
+```
+
+- The faulting instruction is **`movaps`** (16-byte-aligned load *required*) of a
+  RIP-relative **static constant** at `0x10c1278`.
+- `0x10c1278 & 0xf == 0x8` → the constant is **8-byte aligned, not 16** → `#GP`.
+- Registers: **MXCSR = 0x1f80** (default, all exceptions masked) and **EFLAGS =
+  0x10206** (AC/alignment-check bit `0x40000` is **clear**). So it is neither an
+  FP-exception nor an alignment-check-flag effect — it is a real
+  movaps-on-misaligned-16 general-protection fault.
+- The operand is a fixed `.rodata` constant (`.Lanon...`), not a heap/FFI pointer
+  → not corrupted memory, not garbage conf_state, not the allocator.
+
+### Why it is layout-sensitive (the dep-version "trigger")
+
+`objdump -h` on the **debug** `libraft_sys.a` shows `.rodata.cst16` sections (16-byte
+SIMD constants) emitted with **mixed, insufficient alignment**:
+
+```
+102 × .rodata.cst16  align 2**4   (16, correct)
+ 91 × .rodata.cst16  align 2**3   (8  — UNDER-ALIGNED)
+  7 × .rodata.cst16  align 2**0   (1!)
+  1 × .rodata.cst16  align 2**2
+```
+
+The crashing constant (`.Lanon.ffb9a202c598fcdeb2beae8f09e3bf82.4`) is a 16-byte
+entry in `.rodata.cst16`. rustc's `-O0` codegen marks many of these sections only
+8-byte-aligned while still generating `movaps` against them. The linker honours
+the (too-small) 8-byte alignment and packs the section wherever it fits;
+**whether it lands on a 16- or merely-8-aligned address is pure binary layout.**
+Unrelated dep bumps (chrono/log code-size deltas) shift downstream addresses and
+flip that constant across a 16-byte boundary — hence "chrono+log BAD together
+crashes, either alone is fine," and hence it only triggers in the large rove
+binary, never in the tiny in-tree test (same `libraft_sys.a`, different layout).
+
+### Confirmation
+
+- **Release build does not crash.** Building rove (and thus raft-sys) `--release`
+  against the exact BAD tree → 204, host alive, 3/3. In release the intrinsic is a
+  single `pmovmskb` with no constant load, so the misaligned `movaps` never exists.
+- **The in-tree threaded test never crashes** even with c_allocator + initRecover +
+  the BAD tree — because its small binary happens to 16-align the constant.
+
+### The real fix (recommended)
+
+Build the Rust staticlib **optimized regardless of the Zig optimize mode** — e.g.
+in raft-rs-zig's `build.zig`, always pass `--release` (or at least
+`-C opt-level=1`) to the `cargo build` step, decoupled from the consumer's debug/
+release setting. That removes the misaligned-`movaps` codegen permanently and is
+layout-independent.
+
+Pinning `Cargo.lock` (`7ea746d`) is **not** a real fix — it only relays the
+constant onto a 16-aligned address by luck and can regress on any future code or
+dependency change. Keep the committed lock for reproducibility, but the
+opt-level fix is what actually closes the bug.
+
+(Upstream-flavoured note: rustc `-O0` emitting `.rodata.cst16` with 8-byte
+alignment while issuing `movaps` against it is the underlying toolchain issue;
+worth a minimal repro + report if it recurs outside this workaround.)
