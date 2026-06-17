@@ -32,6 +32,20 @@ pub const MemStorage = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, voters: []const u64) !*MemStorage {
+        return initWithLearners(allocator, voters, &.{});
+    }
+
+    /// Like `init`, but the group is BORN with `learners` in its initial
+    /// ConfState (not just voters). Used to bootstrap a node into a group as a
+    /// non-voting learner — a learner does not campaign, so it follows the
+    /// leader and catches up instead of fighting it (the safe way to add a node
+    /// to a high-term group; a born-voter would campaign past the leader's term
+    /// and deadlock). `init` = the common no-learner case.
+    pub fn initWithLearners(
+        allocator: std.mem.Allocator,
+        voters: []const u64,
+        learners: []const u64,
+    ) !*MemStorage {
         const self = try allocator.create(MemStorage);
         self.* = .{
             .allocator = allocator,
@@ -41,6 +55,7 @@ pub const MemStorage = struct {
             .entries_buf = .empty,
         };
         try self.voters.appendSlice(allocator, voters);
+        try self.learners.appendSlice(allocator, learners);
         try self.entries.append(allocator, .{
             .entry_type = 0,
             .term = 0,

@@ -258,6 +258,14 @@ pub const Manager = struct {
         return c.raft_manager_min_match_index(self.ptr, group_id);
     }
 
+    /// This group's local raft last log index, on ANY replica (not leader-gated).
+    /// `null` on an unknown group. The reconciler's learner→promote catch-up gate
+    /// — see `raft_manager_last_index`.
+    pub fn lastIndex(self: *const Manager, group_id: u64) ?u64 {
+        var out: u64 = 0;
+        return if (c.raft_manager_last_index(self.ptr, group_id, &out) == 0) out else null;
+    }
+
     /// Single-change membership operation, proposed on the leader of `group_id`.
     pub const ConfChange = enum(u8) {
         /// Add `node` as a voter, or promote an existing learner to voter.

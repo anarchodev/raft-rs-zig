@@ -989,6 +989,32 @@ pub unsafe extern "C" fn raft_manager_conf_state(
 /// `*out_leader_last` receives the leader's own last log index so the caller
 /// computes each peer's lag as `leader_last - matched`. Returns 0 on success,
 /// -1 unknown group, -2 not leader. Read-only — no notify.
+/// This group's local raft last log index. NOT leader-gated (unlike
+/// `voter_progress`) — every replica, including a non-voting LEARNER, can report
+/// its own last index. The reconciler gates learner→promote on it vs the leader's
+/// `leader_last`: it is the right catch-up signal because an out-of-band baseline
+/// (`apply_local_snapshot`) advances `last_index` directly, whereas the
+/// commit-seq atomic only moves on freshly *committed* entries (so a quiescent
+/// caught-up learner would never trip a commit-based gate). Returns 0 on success,
+/// -1 unknown group. Read-only.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_last_index(
+    m: *const RaftManager,
+    group_id: u64,
+    out_last: *mut u64,
+) -> i32 {
+    if m.is_null() || out_last.is_null() {
+        return -1;
+    }
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    *out_last = slot.node.raft.raft_log.last_index();
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_voter_progress(
     m: *const RaftManager,

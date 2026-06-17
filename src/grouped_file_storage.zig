@@ -862,10 +862,23 @@ pub const GroupedFileStorage = struct {
         wal: *SharedWal,
         group_id: u64,
     ) !*GroupedFileStorage {
+        return initWithLearners(allocator, voters, &.{}, wal, group_id);
+    }
+
+    /// Like `init`, but the group is BORN with `learners` in its ConfState —
+    /// see `MemStorage.initWithLearners`. The membership is persisted to the WAL
+    /// and restored by `initRecover`, so this only seeds a FRESH group.
+    pub fn initWithLearners(
+        allocator: std.mem.Allocator,
+        voters: []const u64,
+        learners: []const u64,
+        wal: *SharedWal,
+        group_id: u64,
+    ) !*GroupedFileStorage {
         const self = try allocator.create(GroupedFileStorage);
         errdefer allocator.destroy(self);
 
-        const mem = try MemStorage.init(allocator, voters);
+        const mem = try MemStorage.initWithLearners(allocator, voters, learners);
         errdefer mem.deinit();
 
         var offsets: std.ArrayList(u64) = .empty;
