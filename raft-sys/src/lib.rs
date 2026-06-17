@@ -1072,23 +1072,37 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
     0
 }
 
-/// The term of the log entry at `index` on `group_id` (for building a
-/// promote-back baseline: the leader reports `term(store.applied)` so the
-/// returning learner installs a baseline whose term matches the leader's log,
-/// or its appends would conflict-reject forever). Returns the term, or 0 if the
-/// index is compacted away / beyond the log / the group is unknown. Read-only.
+/// The term of the log entry at `index` on `group_id`, written to `*out_term`
+/// (for building a promote-back baseline: the leader reports `term(store.applied)`
+/// so the returning learner installs a baseline whose term matches the leader's
+/// log, or its appends would conflict-reject forever). Returns 0 on success
+/// (`*out_term` valid — and a real term of 0 only at the genesis index is
+/// reported as such); -1 if `m`/`out_term` is null or the group is unknown; -2 if
+/// no term is resolvable at `index` (compacted away / beyond the log). The split
+/// matters: a u64-only return collapsed "unknown group" into a fake term 0, which
+/// a caller could stamp into a baseline. Read-only.
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_log_term(
     m: *const RaftManager,
     group_id: u64,
     index: u64,
-) -> u64 {
+    out_term: *mut u64,
+) -> i32 {
+    if m.is_null() || out_term.is_null() {
+        return -1;
+    }
     let mgr = &*m;
     let slot = match mgr.groups.get(&group_id) {
         Some(s) => s,
-        None => return 0,
+        None => return -1, // unknown group — NOT a term of 0
     };
-    slot.node.raft.raft_log.term(index).unwrap_or(0)
+    match slot.node.raft.raft_log.term(index) {
+        Ok(t) => {
+            *out_term = t;
+            0
+        }
+        Err(_) => -2, // compacted away / beyond the log — no resolvable term
+    }
 }
 
 /// Install a DATA-FREE snapshot baseline at {index, term} into `group_id`'s

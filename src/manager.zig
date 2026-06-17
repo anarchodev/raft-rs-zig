@@ -369,11 +369,15 @@ pub const Manager = struct {
         return .{ .peers = out[0..count], .leader_last = leader_last };
     }
 
-    /// The term of the log entry at `index` on `group_id` (0 if compacted /
-    /// beyond the log / unknown group). The leader reports `term(applied)` so a
-    /// returning learner's promote-back baseline matches the leader's log.
-    pub fn logTerm(self: *const Manager, group_id: u64, index: u64) u64 {
-        return c.raft_manager_log_term(self.ptr, group_id, index);
+    /// The term of the log entry at `index` on `group_id`, or `null` when no term
+    /// is resolvable — the group is unknown, or `index` is compacted away / beyond
+    /// the log. The leader reports `term(applied)` so a returning learner's
+    /// promote-back baseline matches the leader's log. `null` is DISTINCT from a
+    /// genuine term of 0 (the genesis index): the old u64-only form collapsed
+    /// "unknown group" into a fake 0 that a caller could stamp into a baseline.
+    pub fn logTerm(self: *const Manager, group_id: u64, index: u64) ?u64 {
+        var out: u64 = 0;
+        return if (c.raft_manager_log_term(self.ptr, group_id, index, &out) == 0) out else null;
     }
 
     /// Install a data-free snapshot baseline at {index, term} into a LOCAL group
