@@ -305,11 +305,21 @@ fn snapshotCb(
     out_meta_term: [*c]u64,
 ) callconv(.c) i32 {
     _ = ud;
-    _ = request_index;
     _ = out_data;
     _ = out_data_len;
     _ = out_meta_index;
     _ = out_meta_term;
+    // rove is SNAPSHOT-FREE: raft only calls this when a peer's next index has
+    // fallen below this node's first (compacted) log index — a member dropped
+    // below the WAL-compaction floor and can no longer catch up from the log. We
+    // cannot serve a snapshot (-1), so the member is stuck until re-bootstrapped
+    // out-of-band (a fresh baseline). For an actively-replicating member this is
+    // impossible by construction — `min_match_index` keeps the floor at/below
+    // every such member's match — so reaching here is a real fault, not a
+    // transient. Log LOUD so it is observable instead of a silently-stuck peer.
+    std.log.err("raft: snapshot requested at index {d} but rove is snapshot-free — a " ++
+        "member fell below the compaction floor and cannot catch up from the log; it " ++
+        "must be re-bootstrapped (fresh baseline). Returning Unavailable.", .{request_index});
     return -1; // SnapshotTemporarilyUnavailable
 }
 

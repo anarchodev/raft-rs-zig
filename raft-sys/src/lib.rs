@@ -839,14 +839,21 @@ pub unsafe extern "C" fn raft_manager_transfer_leadership_away(
     best as i64
 }
 
-/// Minimum `matched` index across all *voters* of `group_id` — the cluster-wide
-/// replication floor. Every voter has every entry at or below this index, so a
-/// node may compact its WAL up to here and still feed any peer from the log
-/// (and, if promoted, serve any voter without a snapshot). Only meaningful on
-/// the leader (a follower does not track peer progress); returns `u64::MAX` if
-/// this node is not the leader or the group is unknown, so the caller's
-/// `min(..)` compaction floor is never *lowered* by a follower or missing group.
-/// Read-only — no notify.
+/// Minimum `matched` index across the *replicating members* of `group_id` — the
+/// cluster-wide WAL-compaction floor. A node may compact its WAL up to here and
+/// still feed every such member FROM THE LOG (rove is snapshot-free, so a member
+/// that falls below the compacted first index can NEVER catch up — there is no
+/// snapshot transport). "Replicating members" = all voters, plus any learner the
+/// leader has heard from within the last election timeout (`recent_active`):
+/// while a learner is actively replicating, retaining its tail lets it catch up —
+/// the high-churn-join case — so it is never compacted past (impossible by
+/// construction). A stalled/dead learner (`!recent_active`) is excluded so it
+/// cannot pin the WAL unboundedly; on return it re-bootstraps from a fresh
+/// baseline. (Voters are always counted — a dead voter is handled by auto-demote,
+/// not by dropping it from the floor.) Only meaningful on the leader (a follower
+/// does not track peer progress); returns `u64::MAX` if this node is not the
+/// leader or the group is unknown, so the caller's `min(..)` compaction floor is
+/// never *lowered* by a follower or missing group. Read-only — no notify.
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_min_match_index(
     m: *const RaftManager,
@@ -865,8 +872,13 @@ pub unsafe extern "C" fn raft_manager_min_match_index(
     let voters = prs.conf().voters();
     let mut min_matched: u64 = u64::MAX;
     for (id, pr) in prs.iter() {
-        if !voters.contains(*id) {
-            continue; // learners don't gate compaction (not quorum members)
+        // A voter always counts. A learner counts only while actively replicating
+        // (`recent_active`): then the leader must retain its tail so it can catch
+        // up from the log (snapshot-free) — a catching-up learner is never
+        // compacted past. A stalled/dead learner is excluded so it cannot pin the
+        // WAL forever (it re-bootstraps from a fresh baseline on return).
+        if !voters.contains(*id) && !pr.recent_active {
+            continue;
         }
         // The leader's own `matched` is its last index; including it is
         // harmless (it never lowers the min). Keep self for symmetry with
