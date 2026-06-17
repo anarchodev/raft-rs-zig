@@ -953,6 +953,14 @@ pub unsafe extern "C" fn raft_manager_conf_state(
     learners_cap: usize,
     out_learners_len: *mut usize,
 ) -> i32 {
+    if m.is_null()
+        || out_voters.is_null()
+        || out_voters_len.is_null()
+        || out_learners.is_null()
+        || out_learners_len.is_null()
+    {
+        return -1;
+    }
     let mgr = &*m;
     let slot = match mgr.groups.get(&group_id) {
         Some(s) => s,
@@ -1026,6 +1034,15 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
     out_len: *mut usize,
     out_leader_last: *mut u64,
 ) -> i32 {
+    if m.is_null()
+        || out_ids.is_null()
+        || out_matched.is_null()
+        || out_recent_active.is_null()
+        || out_len.is_null()
+        || out_leader_last.is_null()
+    {
+        return -1;
+    }
     let mgr = &*m;
     let slot = match mgr.groups.get(&group_id) {
         Some(s) => s,
@@ -1086,7 +1103,8 @@ pub unsafe extern "C" fn raft_manager_log_term(
 /// (the promote is a separate conf-change); `process_ready` installs it via the
 /// `apply_snapshot` storage callback. Returns 0; -1 unknown group; -2 leader (a
 /// leader cannot restore a snapshot to itself); -3 index not ahead of the
-/// committed index (nothing to install); -4 step error.
+/// committed index (nothing to install); -4 step error; -5 invalid baseline
+/// (term 0 for an index>0 — see the guard).
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     m: *mut RaftManager,
@@ -1104,6 +1122,14 @@ pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     }
     if index <= slot.node.raft.raft_log.committed {
         return -3;
+    }
+    // A baseline at index>committed (so index>0) MUST carry a real term. A term-0
+    // baseline makes raft's `restore` fast-forward commit_to past an empty log →
+    // fatal!, and with panic=abort that takes down EVERY tenant on this node. The
+    // Zig door + bridge already reject this; this is the engine's last-resort
+    // backstop. Reject as bad input rather than stepping a crash-prone snapshot.
+    if term == 0 {
+        return -5;
     }
     let self_id = slot.node.raft.id;
     let cur_term = slot.node.raft.term;
@@ -1522,13 +1548,38 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     // error is deterministic across replicas (no divergence) — log + skip; the
     // propose-side quorum guard prevents invalid changes.
     for entry in &conf_changes {
+        // A committed conf-change that fails to decode or apply is an INVARIANT
+        // VIOLATION (the propose-side quorum guard should have rejected it, and a
+        // committed entry is by definition well-formed) — it is deterministic
+        // across replicas so it does not diverge them, but it must not be a SILENT
+        // skip. Fail loud to stderr; the membership simply isn't advanced.
         let cs = match entry.get_entry_type() {
-            EntryType::EntryConfChange => ConfChange::parse_from_bytes(&entry.data)
-                .ok()
-                .and_then(|cc| slot.node.apply_conf_change(&cc).ok()),
-            EntryType::EntryConfChangeV2 => ConfChangeV2::parse_from_bytes(&entry.data)
-                .ok()
-                .and_then(|cc| slot.node.apply_conf_change(&cc).ok()),
+            EntryType::EntryConfChange => match ConfChange::parse_from_bytes(&entry.data) {
+                Ok(cc) => match slot.node.apply_conf_change(&cc) {
+                    Ok(cs) => Some(cs),
+                    Err(e) => {
+                        eprintln!("raft-sys: BUG apply_conf_change failed on committed entry (group {}): {}", group_id, e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("raft-sys: BUG failed to decode committed ConfChange (group {}): {}", group_id, e);
+                    None
+                }
+            },
+            EntryType::EntryConfChangeV2 => match ConfChangeV2::parse_from_bytes(&entry.data) {
+                Ok(cc) => match slot.node.apply_conf_change(&cc) {
+                    Ok(cs) => Some(cs),
+                    Err(e) => {
+                        eprintln!("raft-sys: BUG apply_conf_change(V2) failed on committed entry (group {}): {}", group_id, e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    eprintln!("raft-sys: BUG failed to decode committed ConfChangeV2 (group {}): {}", group_id, e);
+                    None
+                }
+            },
             _ => None,
         };
         if let Some(cs) = cs {
@@ -1600,15 +1651,19 @@ pub unsafe extern "C" fn raft_manager_on_persist(m: *mut RaftManager, group_id: 
 }
 
 /// Serialize each `Message` via rust-protobuf and push into the
-/// outbox keyed by recipient. Failed serializations are dropped
-/// (logged in the future; currently silent — these should never
-/// happen for well-formed raft messages).
+/// outbox keyed by recipient. A serialization failure is an INVARIANT
+/// VIOLATION (raft never emits an un-serializable message) — dropping
+/// one silently stalls replication invisibly, so fail LOUD to stderr.
 fn push_messages(outbox: &mut Vec<(u64, Vec<u8>)>, msgs: Vec<Message>) {
     for msg in msgs {
         let to = msg.to;
         match msg.write_to_bytes() {
             Ok(bytes) => outbox.push((to, bytes)),
-            Err(_) => { /* unreachable for valid messages */ }
+            Err(e) => eprintln!(
+                "raft-sys: BUG dropping un-serializable outbound message to {}: {} \
+                 (raft messages must always serialize)",
+                to, e
+            ),
         }
     }
 }
