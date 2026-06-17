@@ -395,19 +395,31 @@ pub const SharedWal = struct {
 
         // Maintain the GC + header caches from the append stream itself,
         // so neither needs back-pointers to the groups.
+        // A structurally-required record with the wrong payload length is an
+        // invariant violation (these payloads are fixed/min-size by construction).
+        // Previously the cache update was silently skipped while the record was
+        // still WRITTEN — leaving an on-disk record the GC/header caches don't
+        // track, so e.g. an un-tracked entry's segment can be GC'd while it is
+        // still live (silent log loss). Reject up front instead.
         switch (tag) {
-            .hardstate => if (payload.len == HS_PAYLOAD_LEN) {
+            .hardstate => {
+                if (payload.len != HS_PAYLOAD_LEN) return error.MalformedRecord;
                 var hs: [HS_PAYLOAD_LEN]u8 = undefined;
                 @memcpy(&hs, payload[0..HS_PAYLOAD_LEN]);
                 try self.hardstate_cache.put(group_id, hs);
             },
+            // Entry payload: entry_type u32, term u64, index u64, … A real entry
+            // is always >= 29 bytes (writeEntryRecord), so this floor never trips
+            // in production; tests use .entry as a generic small-record framing
+            // vehicle, so SKIP-the-cache (not reject) here, unlike the exact-size
+            // hardstate/compaction records above which are hard invariants.
             .entry => if (payload.len >= 20) {
-                // Entry payload: entry_type u32, term u64, index u64, ...
                 const idx = std.mem.readInt(u64, payload[12..20], .little);
                 const gop = try self.active_group_max.getOrPut(group_id);
                 if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
             },
-            .compaction => if (payload.len == COMPACTION_PAYLOAD_LEN) {
+            .compaction => {
+                if (payload.len != COMPACTION_PAYLOAD_LEN) return error.MalformedRecord;
                 var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
                 @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
                 try self.compaction_cache.put(group_id, cp);
@@ -480,6 +492,16 @@ pub const SharedWal = struct {
         while (csit.next()) |e| {
             _ = try self.writeFramed(e.key_ptr.*, .confstate, e.value_ptr.*);
         }
+
+        // DURABILITY: the model relies on "the newest segment always carries every
+        // live group's hard state / compaction / confstate," which is what makes
+        // GC of older sealed segments safe. That holds only once this re-baselined
+        // header is durable — otherwise a later gcSealed could unlink an older
+        // segment while this header is still only in page cache, and a crash loses
+        // a quiet group's only durable copy. fsync the new active segment, and
+        // fsync the directory so the rename (old → sealed) survives a crash too.
+        try self.file.sync();
+        syncParentDir(self.wal_path);
     }
 
     /// Record group `group_id`'s compaction watermark and reclaim any
@@ -516,7 +538,10 @@ pub const SharedWal = struct {
                 var seg = self.sealed.orderedRemove(i); // keep oldest-first order
                 var pbuf: [std.fs.max_path_bytes]u8 = undefined;
                 if (sealedSegmentPath(&pbuf, self.wal_path, seg.seg_no)) |p| {
-                    std.fs.cwd().deleteFile(p) catch {};
+                    // Soft (recovery skips a stale dead file), but a chronic unlink
+                    // failure is silent disk leakage — surface it for the operator.
+                    std.fs.cwd().deleteFile(p) catch |e|
+                        std.log.warn("raft WAL: failed to delete GC'd segment {s}: {s} (leaked until restart)", .{ p, @errorName(e) });
                 } else |_| {}
                 seg.group_max.deinit();
             } else i += 1;
@@ -533,14 +558,33 @@ pub const SharedWal = struct {
     }
 };
 
+/// Best-effort fsync of the directory containing `path`, so a rename/create of
+/// a file within it is made durable (a rename is only a metadata op until the
+/// directory is synced). Best-effort: a failure here is logged by the caller's
+/// reliance on the subsequent file fsync; we never block a roll on it.
+fn syncParentDir(path: []const u8) void {
+    const dir_path = std.fs.path.dirname(path) orelse ".";
+    var dir = std.fs.cwd().openDir(dir_path, .{}) catch return;
+    defer dir.close();
+    // Raw syscall, result ignored: std.posix.fsync maps EINVAL (some filesystems
+    // — incl. the test tmpfs — reject directory fsync) to `unreachable`, which
+    // would panic. This is best-effort durability, so swallow whatever it returns.
+    _ = std.posix.system.fsync(dir.fd);
+}
+
 /// Discover the sealed-segment numbers for `wal_path` (files named
 /// `{basename}.{digits}` next to it), sorted ascending. Returns an empty
-/// slice if the directory can't be opened (fresh boot, no segments).
+/// slice if the directory does not exist (fresh boot, no segments); a real
+/// I/O error opening it is propagated (NOT silently treated as "no segments",
+/// which would drop the compacted-but-not-active log history).
 fn discoverSealedSegments(allocator: std.mem.Allocator, wal_path: []const u8) ![]u64 {
     const dir_path = std.fs.path.dirname(wal_path) orelse ".";
     const base_name = std.fs.path.basename(wal_path);
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return &[_]u64{};
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return &[_]u64{}, // fresh boot — no segments yet
+        else => return e, // EACCES/EIO/… — propagate; do NOT silently drop the log history
+    };
     defer dir.close();
 
     var list: std.ArrayList(u64) = .empty;
@@ -815,11 +859,14 @@ pub const GroupedFileStorage = struct {
                     // Records are in file order → applying each in turn leaves
                     // the LATEST membership (last-wins), so a restarted group
                     // comes back with its current voters/learners.
-                    if (decodeConfState(self.allocator, r.payload)) |dc| {
-                        defer self.allocator.free(dc.voters);
-                        defer self.allocator.free(dc.learners);
-                        self.mem.setConfState(dc.voters, dc.learners) catch {};
-                    } else |_| {}
+                    // A confstate record that survived CRC but won't decode/apply
+                    // is an invariant violation (corruption or a codec bug);
+                    // recovering with stale/wrong membership can split-brain the
+                    // group, so fail recovery loudly rather than swallow it.
+                    const dc = try decodeConfState(self.allocator, r.payload);
+                    defer self.allocator.free(dc.voters);
+                    defer self.allocator.free(dc.learners);
+                    try self.mem.setConfState(dc.voters, dc.learners);
                 },
             };
         }
@@ -942,6 +989,12 @@ pub const GroupedFileStorage = struct {
         std.mem.writeInt(u64, cp[8..16], self.mem.entries.items[0].term, .little);
         _ = try self.wal.appendRecord(self.group_id, .compaction, &cp);
 
+        // DURABILITY: the marker must be fsynced BEFORE GC unlinks the segment(s)
+        // it protects. noteCompaction → gcSealed deletes synchronously; a crash
+        // after the (durable) unlink but before this fsync would lose the marker
+        // while the entries are already gone → recovery sees a gap. fsync first.
+        try self.wal.flush();
+
         // Tell the WAL so it can reclaim any segment now fully below
         // this (and every other group's) watermark.
         try self.wal.noteCompaction(self.group_id, index);
@@ -965,6 +1018,9 @@ pub const GroupedFileStorage = struct {
         std.mem.writeInt(u64, cp[0..8], index, .little);
         std.mem.writeInt(u64, cp[8..16], term, .little);
         _ = try self.wal.appendRecord(self.group_id, .compaction, &cp);
+        // DURABILITY: fsync the marker before gcSealed unlinks the segments it
+        // protects (see compact() — same crash-window hazard).
+        try self.wal.flush();
         try self.wal.noteCompaction(self.group_id, index);
     }
 
