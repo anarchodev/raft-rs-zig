@@ -1086,15 +1086,28 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
     0
 }
 
-/// Peer ids (voters AND learners, excluding self) whose leader-side Progress is in
-/// `ProgressState::Snapshot` — raft wants to send them a snapshot because their
-/// `next_idx` fell below this node's first (compacted) log index. This is the
-/// TRIGGER for rove's out-of-band catch-up: the leader polls this and, for each
-/// id, drives a bundle pull + `apply_local_snapshot` on that peer (the storage
-/// `snapshot` cb itself stays Unavailable — raft just parks the peer here). Only
-/// meaningful on the leader (a follower does not track peer Progress): -2 if not
-/// leader, -1 unknown group / null out-ptr. `*out_len` is the true count even if
-/// it exceeds `cap`, so the caller can detect truncation. Read-only — no notify.
+/// Peer ids (voters AND learners, excluding self) that have fallen BELOW this
+/// leader's first (compacted) log index and so can no longer catch up from the
+/// log — the TRIGGER for rove's out-of-band snapshot catch-up. The leader polls
+/// this and, for each id, dumps its store + pushes `v2-load-replace` +
+/// `apply_local_snapshot` to that peer.
+///
+/// Why `matched + 1 < first_index` and NOT `ProgressState::Snapshot`: raft-rs
+/// only moves a peer to `Snapshot` when `prepare_send_snapshot` actually obtains
+/// a snapshot from storage (`raft.rs:716` `become_snapshot`). rove's `snapshot`
+/// cb stays `SnapshotTemporarilyUnavailable` (the out-of-band data path carries
+/// the bytes, NOT an on-pump `MsgSnapshot`), so `prepare_send_snapshot` returns
+/// false BEFORE `become_snapshot` (`raft.rs:689`) and the peer stays in `Probe`
+/// forever — it NEVER enters `Snapshot`. So we detect the condition raft itself
+/// uses to decide a snapshot is needed — the peer's next required entry
+/// (`matched + 1`) is below `first_index` (compacted away) — directly from
+/// Progress. Gated on `recent_active`: a peer out of contact can't receive the
+/// push anyway (and `prepare_send_snapshot` skips it too), so triggering on it
+/// would just churn failed pushes.
+///
+/// Only meaningful on the leader (a follower does not track peer Progress): -2 if
+/// not leader, -1 unknown group / null out-ptr. `*out_len` is the true count even
+/// if it exceeds `cap`, so the caller can detect truncation. Read-only — no notify.
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_snapshot_pending_peers(
     m: *const RaftManager,
@@ -1115,6 +1128,7 @@ pub unsafe extern "C" fn raft_manager_snapshot_pending_peers(
         return -2;
     }
     let self_id = slot.node.raft.id;
+    let first_index = slot.node.raft.raft_log.first_index();
     let prs = slot.node.raft.prs();
     let mut n = 0usize;
     for (id, pr) in prs.iter() {
@@ -1122,7 +1136,10 @@ pub unsafe extern "C" fn raft_manager_snapshot_pending_peers(
         if id == self_id {
             continue; // self never needs a snapshot from itself
         }
-        if pr.state == ProgressState::Snapshot {
+        // The peer's next needed entry (matched + 1) is below the leader's first
+        // available log index ⇒ it was compacted away ⇒ no log catch-up is
+        // possible ⇒ out-of-band snapshot. recent_active ⇒ the peer is reachable.
+        if pr.recent_active && pr.matched + 1 < first_index {
             if n < cap {
                 *out_ids.add(n) = id;
             }
