@@ -112,6 +112,12 @@ pub const Error = error{
     /// index>0 (a term-0 baseline crashes raft's restore — rejected both at this
     /// wrapper and in the FFI engine, code -5).
     InvalidBaseline,
+    /// A caller-supplied snapshot ConfState (membership SSOT) did not contain
+    /// this node — raft's `restore` would discard the snapshot (raft.rs:2581), so
+    /// the FFI rejected it (code -6). The node must be conf-change-added to the
+    /// group's membership BEFORE its baseline is installed (TiKV's add-peer-then-
+    /// snapshot ordering).
+    SelfNotInConfState,
     ProcessReadyFailed,
     TakeMessagesFailed,
     StepFailed,
@@ -400,18 +406,39 @@ pub const Manager = struct {
     /// the tail and the node can be promoted back. Pump-thread only.
     /// `Error.NotLeader` if this node leads the group (a leader can't restore to
     /// itself); `Error.SnapshotStale` if `index` is not ahead of committed.
-    pub fn applyLocalSnapshot(self: *Manager, group_id: u64, index: u64, term: u64) Error!void {
+    ///
+    /// Membership (Phase 2 — membership SSOT): `voters`/`learners` non-null make
+    /// the baseline carry the SUPPLIED membership (the source leader's ConfState),
+    /// so a joining node learns its real membership from the baseline instead of a
+    /// static env voter set. Null `voters` keeps the group's CURRENT membership
+    /// (the membership-neutral promote-back, unchanged). Passed as primitive u64
+    /// slices, NOT a ConfState struct (cross-`@cImport` structs don't unify). The
+    /// supplied membership MUST contain this node or raft's `restore` discards the
+    /// snapshot — `Error.SelfNotInConfState`.
+    pub fn applyLocalSnapshot(
+        self: *Manager,
+        group_id: u64,
+        index: u64,
+        term: u64,
+        voters: ?[]const u64,
+        learners: ?[]const u64,
+    ) Error!void {
         // Second gate (the FFI engine is the first): a baseline must be a real
         // {index>0, term>0} pair. A {0,_} or {n,0} baseline is meaningless and a
         // term-0 baseline crashes raft's restore — reject loudly here.
         if (index == 0 or term == 0) return Error.InvalidBaseline;
-        const rc = c.raft_manager_apply_local_snapshot(self.ptr, group_id, index, term);
+        const v_ptr: ?[*]const u64 = if (voters) |v| v.ptr else null;
+        const v_len: usize = if (voters) |v| v.len else 0;
+        const l_ptr: ?[*]const u64 = if (learners) |l| l.ptr else null;
+        const l_len: usize = if (learners) |l| l.len else 0;
+        const rc = c.raft_manager_apply_local_snapshot(self.ptr, group_id, index, term, v_ptr, v_len, l_ptr, l_len);
         return switch (rc) {
             0 => {},
             -1 => Error.UnknownGroup,
             -2 => Error.NotLeader,
             -3 => Error.SnapshotStale,
             -5 => Error.InvalidBaseline, // engine rejected a term-0 baseline
+            -6 => Error.SelfNotInConfState, // supplied ConfState omits this node
             else => Error.ProposeFailed,
         };
     }

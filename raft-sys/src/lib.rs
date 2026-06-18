@@ -1184,25 +1184,40 @@ pub unsafe extern "C" fn raft_manager_log_term(
 }
 
 /// Install a DATA-FREE snapshot baseline at {index, term} into `group_id`'s
-/// LOCAL raft log (conf_change Phase 2 promote-back). The node must be a
-/// learner/follower that has fallen below the leader's compacted log floor — it
-/// can no longer catch up by replication and rove has no in-protocol snapshot
-/// transport. The KV state for `index` is delivered out-of-band (the move
-/// bundle) BEFORE this call; this only fast-forwards the raft LOG baseline so
-/// the leader can then replicate the tail (> index) from its log and the node
-/// can be promoted back to a voter. Steps a self-addressed `MsgSnapshot`
-/// carrying the group's CURRENT membership, so applying it is membership-neutral
-/// (the promote is a separate conf-change); `process_ready` installs it via the
-/// `apply_snapshot` storage callback. Returns 0; -1 unknown group; -2 leader (a
-/// leader cannot restore a snapshot to itself); -3 index not ahead of the
-/// committed index (nothing to install); -4 step error; -5 invalid baseline
-/// (term 0 for an index>0 — see the guard).
+/// LOCAL raft log (conf_change Phase 2 promote-back / membership SSOT). The node
+/// must be a learner/follower that has fallen below the leader's compacted log
+/// floor — it can no longer catch up by replication and rove has no in-protocol
+/// snapshot transport. The KV state for `index` is delivered out-of-band (the
+/// move bundle) BEFORE this call; this only fast-forwards the raft LOG baseline so
+/// the leader can then replicate the tail (> index) from its log and the node can
+/// be promoted back to a voter. Steps a self-addressed `MsgSnapshot` carrying a
+/// ConfState; `process_ready` installs it via the `apply_snapshot` storage
+/// callback, and `restore` rebuilds membership from that ConfState.
+///
+/// Membership source (Phase 2 — membership SSOT): if `voters`/`learners` are
+/// non-null, the baseline carries the CALLER-SUPPLIED membership (the source
+/// leader's ConfState), so a joining node learns its real membership from the
+/// baseline instead of a static env voter set. If `voters` is null (or both lens
+/// are 0), it falls back to the group's CURRENT prs — the membership-neutral
+/// promote-back behavior (unchanged). Passed as PRIMITIVE u64 arrays, NOT a
+/// ConfState struct: structs from separate `@cImport`s don't unify in rove's
+/// build (the 2a landmine), primitives do.
+///
+/// Returns 0; -1 unknown group; -2 leader (a leader cannot restore a snapshot to
+/// itself); -3 index not ahead of the committed index (nothing to install); -4
+/// step error; -5 invalid baseline (term 0 for an index>0 — see the guard); -6
+/// caller-supplied ConfState omits this node (restore would discard it — add the
+/// node to the membership first).
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     m: *mut RaftManager,
     group_id: u64,
     index: u64,
     term: u64,
+    voters: *const u64,
+    voters_len: usize,
+    learners: *const u64,
+    learners_len: usize,
 ) -> i32 {
     let mgr = &mut *m;
     let slot = match mgr.groups.get_mut(&group_id) {
@@ -1225,10 +1240,27 @@ pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     }
     let self_id = slot.node.raft.id;
     let cur_term = slot.node.raft.term;
-    // Stamp the group's CURRENT membership so `restore` finds this node a member
-    // and the apply is membership-neutral (promote-back is a later conf-change).
+    // The ConfState the baseline carries. Caller-supplied (membership SSOT) when
+    // `voters` is non-null; otherwise the group's CURRENT prs (membership-neutral
+    // promote-back). `restore` rebuilds the group's membership from this.
     let mut cs = ConfState::default();
-    {
+    if !voters.is_null() {
+        cs.set_voters(std::slice::from_raw_parts(voters, voters_len).to_vec());
+        if !learners.is_null() && learners_len > 0 {
+            cs.set_learners(std::slice::from_raw_parts(learners, learners_len).to_vec());
+        }
+        // raft-rs `restore` (raft.rs:2581) THROWS AWAY a snapshot whose ConfState
+        // does not contain the recipient ("not in the config"). A caller-supplied
+        // membership that omits this node would make restore silently no-op and
+        // leave the baseline uninstalled. Reject up front so the caller learns its
+        // join sequence is wrong (the node must be conf-change-added to the
+        // membership BEFORE its baseline is installed — TiKV's add-peer-then-
+        // snapshot ordering). -6 = self not in the supplied ConfState.
+        let in_cs = cs.get_voters().contains(&self_id) || cs.get_learners().contains(&self_id);
+        if !in_cs {
+            return -6;
+        }
+    } else {
         let prs = slot.node.raft.prs();
         cs.set_voters(prs.conf().voters().ids().iter().collect());
         cs.set_learners(prs.conf().learners().iter().copied().collect());
