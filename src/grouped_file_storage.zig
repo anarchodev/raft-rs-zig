@@ -1101,11 +1101,7 @@ fn snapshotCb(
     out_data_len: [*c]usize,
     out_meta_index: [*c]u64,
     out_meta_term: [*c]u64,
-    out_conf_state: [*c]c.RaftConfStateFfi,
 ) callconv(.c) i32 {
-    // Phase 1 will produce the staged snapshot HERE (this layer has the group
-    // id, so it can resolve rove's staged tenant bundle + ConfState). For now it
-    // delegates to MemStorage, which reports Unavailable → raft retries.
     const self: *GroupedFileStorage = @ptrCast(@alignCast(ud.?));
     return mem_storage.vtable.snapshot.?(
         self.mem,
@@ -1114,7 +1110,6 @@ fn snapshotCb(
         out_data_len,
         out_meta_index,
         out_meta_term,
-        out_conf_state,
     );
 }
 
