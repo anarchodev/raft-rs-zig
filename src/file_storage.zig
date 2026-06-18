@@ -244,6 +244,7 @@ fn snapshotCb(
     out_data_len: [*c]usize,
     out_meta_index: [*c]u64,
     out_meta_term: [*c]u64,
+    out_conf_state: [*c]c.RaftConfStateFfi,
 ) callconv(.c) i32 {
     const self: *FileStorage = @ptrCast(@alignCast(ud.?));
     return mem_storage.vtable.snapshot.?(
@@ -253,6 +254,7 @@ fn snapshotCb(
         out_data_len,
         out_meta_index,
         out_meta_term,
+        out_conf_state,
     );
 }
 

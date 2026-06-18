@@ -71,6 +71,13 @@ pub struct RaftStorageVTable {
     pub term: Option<unsafe extern "C" fn(*mut c_void, u64, *mut u64) -> i32>,
     pub first_index: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> i32>,
     pub last_index: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> i32>,
+    /// Produce a snapshot for `request_index` to send to peer `to`. The
+    /// implementer fills the data pointer (the application snapshot bytes — for
+    /// rove, the staged tenant bundle, or a small pointer to it), the metadata
+    /// index/term, AND the group's ConfState at that index (so the receiver's
+    /// `restore` rebuilds membership from the snapshot — the raft-native way).
+    /// Return non-zero (e.g. while the bundle is still being staged off-pump) →
+    /// `SnapshotTemporarilyUnavailable`; raft backs off and retries.
     pub snapshot: Option<
         unsafe extern "C" fn(
             *mut c_void,
@@ -79,6 +86,7 @@ pub struct RaftStorageVTable {
             *mut usize,
             *mut u64,
             *mut u64,
+            *mut RaftConfStateFfi,
         ) -> i32,
     >,
     pub append_entries:
@@ -133,6 +141,45 @@ fn store_err_from_rc(rc: i32) -> raft::Error {
 
 fn snap_unavailable() -> raft::Error {
     raft::Error::Store(raft::StorageError::SnapshotTemporarilyUnavailable)
+}
+
+/// An all-null/zero `RaftConfStateFfi` for the callback to fill in place.
+fn empty_conf_state_ffi() -> RaftConfStateFfi {
+    RaftConfStateFfi {
+        voters: ptr::null(),
+        voters_len: 0,
+        learners: ptr::null(),
+        learners_len: 0,
+        voters_outgoing: ptr::null(),
+        voters_outgoing_len: 0,
+        learners_next: ptr::null(),
+        learners_next_len: 0,
+        auto_leave: false,
+    }
+}
+
+/// Convert a callback-filled `RaftConfStateFfi` (pointers into caller-owned
+/// memory, valid for the call) into an owned `ConfState`.
+fn conf_state_from_ffi(cs: &RaftConfStateFfi) -> ConfState {
+    let mut conf_state = ConfState::default();
+    if !cs.voters.is_null() && cs.voters_len > 0 {
+        conf_state.set_voters(unsafe { slice::from_raw_parts(cs.voters, cs.voters_len) }.to_vec());
+    }
+    if !cs.learners.is_null() && cs.learners_len > 0 {
+        conf_state
+            .set_learners(unsafe { slice::from_raw_parts(cs.learners, cs.learners_len) }.to_vec());
+    }
+    if !cs.voters_outgoing.is_null() && cs.voters_outgoing_len > 0 {
+        conf_state.set_voters_outgoing(
+            unsafe { slice::from_raw_parts(cs.voters_outgoing, cs.voters_outgoing_len) }.to_vec(),
+        );
+    }
+    if !cs.learners_next.is_null() && cs.learners_next_len > 0 {
+        conf_state.set_learners_next(
+            unsafe { slice::from_raw_parts(cs.learners_next, cs.learners_next_len) }.to_vec(),
+        );
+    }
+    conf_state
 }
 
 impl Storage for FfiStorage {
@@ -286,6 +333,7 @@ impl Storage for FfiStorage {
         let mut data_len: usize = 0;
         let mut meta_index: u64 = 0;
         let mut meta_term: u64 = 0;
+        let mut cs = empty_conf_state_ffi();
         let rc = unsafe {
             cb(
                 self.userdata,
@@ -294,6 +342,7 @@ impl Storage for FfiStorage {
                 &mut data_len,
                 &mut meta_index,
                 &mut meta_term,
+                &mut cs,
             )
         };
         if rc != 0 {
@@ -310,6 +359,8 @@ impl Storage for FfiStorage {
         let mut meta = SnapshotMetadata::default();
         meta.set_index(meta_index);
         meta.set_term(meta_term);
+        // The receiver's `restore` rebuilds membership from this ConfState.
+        meta.set_conf_state(conf_state_from_ffi(&cs));
         snap.set_metadata(meta);
         Ok(snap)
     }
