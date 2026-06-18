@@ -369,6 +369,19 @@ pub const Manager = struct {
         return .{ .peers = out[0..count], .leader_last = leader_last };
     }
 
+    /// Peer ids whose leader-side Progress is in `ProgressState::Snapshot` — the
+    /// trigger for rove's out-of-band catch-up (see
+    /// `raft_manager_snapshot_pending_peers`). Writes into `ids_buf`; returns the
+    /// populated prefix, or null if this node is not the leader / unknown group.
+    pub fn snapshotPendingPeers(self: *const Manager, group_id: u64, ids_buf: []u64) ?[]u64 {
+        var n: usize = 0;
+        const rc = c.raft_manager_snapshot_pending_peers(self.ptr, group_id, ids_buf.ptr, ids_buf.len, &n);
+        if (rc != 0) return null;
+        if (n > ids_buf.len)
+            std.log.err("raft snapshotPendingPeers(group {d}): {d} peers exceed buffer cap {d} — list INCOMPLETE", .{ group_id, n, ids_buf.len });
+        return ids_buf[0..@min(n, ids_buf.len)];
+    }
+
     /// The term of the log entry at `index` on `group_id`, or `null` when no term
     /// is resolvable — the group is unknown, or `index` is compacted away / beyond
     /// the log. The leader reports `term(applied)` so a returning learner's

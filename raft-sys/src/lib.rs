@@ -9,7 +9,9 @@ use protobuf::Message as PbMessage;
 use raft::eraftpb::{ConfState, HardState, Snapshot, SnapshotMetadata};
 use raft::prelude::*;
 use raft::storage::Storage;
-use raft::{Config, GetEntriesContext, RaftState, RawNode, ReadOnlyOption, StateRole};
+use raft::{
+    Config, GetEntriesContext, ProgressState, RaftState, RawNode, ReadOnlyOption, StateRole,
+};
 use slog::{o, Discard, Logger};
 
 // ─── Flat FFI types for crossing the boundary ───────────────────────────────
@@ -1130,6 +1132,53 @@ pub unsafe extern "C" fn raft_manager_voter_progress(
             *out_recent_active.add(n) = u8::from(pr.recent_active);
         }
         n += 1;
+    }
+    *out_len = n;
+    0
+}
+
+/// Peer ids (voters AND learners, excluding self) whose leader-side Progress is in
+/// `ProgressState::Snapshot` — raft wants to send them a snapshot because their
+/// `next_idx` fell below this node's first (compacted) log index. This is the
+/// TRIGGER for rove's out-of-band catch-up: the leader polls this and, for each
+/// id, drives a bundle pull + `apply_local_snapshot` on that peer (the storage
+/// `snapshot` cb itself stays Unavailable — raft just parks the peer here). Only
+/// meaningful on the leader (a follower does not track peer Progress): -2 if not
+/// leader, -1 unknown group / null out-ptr. `*out_len` is the true count even if
+/// it exceeds `cap`, so the caller can detect truncation. Read-only — no notify.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_snapshot_pending_peers(
+    m: *const RaftManager,
+    group_id: u64,
+    out_ids: *mut u64,
+    cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if m.is_null() || out_ids.is_null() || out_len.is_null() {
+        return -1;
+    }
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state != StateRole::Leader {
+        return -2;
+    }
+    let self_id = slot.node.raft.id;
+    let prs = slot.node.raft.prs();
+    let mut n = 0usize;
+    for (id, pr) in prs.iter() {
+        let id = *id;
+        if id == self_id {
+            continue; // self never needs a snapshot from itself
+        }
+        if pr.state == ProgressState::Snapshot {
+            if n < cap {
+                *out_ids.add(n) = id;
+            }
+            n += 1;
+        }
     }
     *out_len = n;
     0
