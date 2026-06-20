@@ -399,6 +399,20 @@ pub const Manager = struct {
         return if (c.raft_manager_log_term(self.ptr, group_id, index, &out) == 0) out else null;
     }
 
+    pub const LogEntry = struct { term: u64, data: []const u8 };
+
+    /// Read the raft LOG entry at `index` on `group_id` into `buf` (diagnostics —
+    /// the replicated log content, distinct from the store). Returns `null` on
+    /// unknown group, no entry at `index` (compacted / beyond the log), or `buf`
+    /// too small. `data` slices into `buf` (may be empty for a no-op/conf-change).
+    pub fn logEntry(self: *const Manager, group_id: u64, index: u64, buf: []u8) ?LogEntry {
+        var term: u64 = 0;
+        var len: usize = 0;
+        const rc = c.raft_manager_log_entry(self.ptr, group_id, index, &term, buf.ptr, buf.len, &len);
+        if (rc != 0) return null;
+        return .{ .term = term, .data = buf[0..len] };
+    }
+
     /// Install a data-free snapshot baseline at {index, term} into a LOCAL group
     /// (conf_change promote-back). The node must be a below-floor learner; the
     /// KV state for `index` must already be loaded out-of-band (the move

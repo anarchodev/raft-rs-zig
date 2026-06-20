@@ -1183,6 +1183,62 @@ pub unsafe extern "C" fn raft_manager_log_term(
     }
 }
 
+/// Read the raft LOG entry at `index` for DIAGNOSTICS (the prod `__auth__` fork
+/// hunt): copies the entry's DATA (the caller's opaque envelope bytes) into `buf`
+/// and writes its term + length. UNLIKE the store, this is the replicated LOG
+/// content — so a caller can tell an orphaned speculative fold (store != log)
+/// from divergent committed logs (logs differ across nodes). Read-only; no raft
+/// state change.
+///
+/// Returns 0 on success (`*out_term` + `*out_len` valid; data in `buf[..*out_len]`).
+/// An empty-data entry (a raft no-op or a conf-change) returns 0 with `*out_len`=0.
+/// -1: a null arg or unknown group. -2: no entry at `index` (compacted away /
+/// beyond `last_index`). -3: `buf_cap` too small — `*out_len` is set to the
+/// required size so the caller can retry with a bigger buffer.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_log_entry(
+    m: *const RaftManager,
+    group_id: u64,
+    index: u64,
+    out_term: *mut u64,
+    buf: *mut u8,
+    buf_cap: usize,
+    out_len: *mut usize,
+) -> i32 {
+    if m.is_null() || out_term.is_null() || out_len.is_null() {
+        return -1;
+    }
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    // Read exactly one entry, [index, index+1). `slice` errors (Compacted /
+    // out-of-bounds) → no resolvable entry at this index.
+    let ents = match slot
+        .node
+        .raft
+        .raft_log
+        .slice(index, index + 1, None, GetEntriesContext::empty(false))
+    {
+        Ok(e) => e,
+        Err(_) => return -2,
+    };
+    let entry = match ents.first() {
+        Some(e) => e,
+        None => return -2,
+    };
+    *out_term = entry.term;
+    *out_len = entry.data.len();
+    if entry.data.len() > buf_cap {
+        return -3; // caller retries with *out_len bytes
+    }
+    if !buf.is_null() && !entry.data.is_empty() {
+        std::ptr::copy_nonoverlapping(entry.data.as_ptr(), buf, entry.data.len());
+    }
+    0
+}
+
 /// Install a DATA-FREE snapshot baseline at {index, term} into `group_id`'s
 /// LOCAL raft log (conf_change Phase 2 promote-back / membership SSOT). The node
 /// must be a learner/follower that has fallen below the leader's compacted log
