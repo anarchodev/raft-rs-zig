@@ -814,7 +814,7 @@ pub const GroupedFileStorage = struct {
         wal: *SharedWal,
         group_id: u64,
     ) !*GroupedFileStorage {
-        const self = try GroupedFileStorage.init(allocator, voters, wal, group_id);
+        const self = try GroupedFileStorage.initCore(allocator, voters, &.{}, wal, group_id);
         errdefer self.deinit();
 
         if (wal.takeRecovered(group_id)) |taken| {
@@ -913,9 +913,34 @@ pub const GroupedFileStorage = struct {
     }
 
     /// Like `init`, but the group is BORN with `learners` in its ConfState —
-    /// see `MemStorage.initWithLearners`. The membership is persisted to the WAL
-    /// and restored by `initRecover`, so this only seeds a FRESH group.
+    /// see `MemStorage.initWithLearners`. A FRESH group only.
+    ///
+    /// The genesis membership is PERSISTED to the WAL as a confstate record so
+    /// `initRecover` restores the BORN voter set. Without this, recovery falls
+    /// back to the static seed it is constructed with (rove passes the node's
+    /// `REWIND_VOTERS`); a group born with a different set — e.g. a CP-supplied
+    /// voter SUBSET on a node whose env voter set is larger — would silently
+    /// change membership across a restart, and asynchronous restarts across the
+    /// cluster then leave nodes disagreeing on the voter set: an entry committed
+    /// under one quorum view is truncated under another → a permanent store fork.
     pub fn initWithLearners(
+        allocator: std.mem.Allocator,
+        voters: []const u64,
+        learners: []const u64,
+        wal: *SharedWal,
+        group_id: u64,
+    ) !*GroupedFileStorage {
+        const self = try initCore(allocator, voters, learners, wal, group_id);
+        errdefer self.deinit();
+        try self.persistConfState(voters, learners);
+        return self;
+    }
+
+    /// In-memory construction only — NO genesis confstate record. `initRecover`
+    /// uses this: it replays membership from the WAL's own confstate records, so
+    /// writing one here would append a stale SEED record that last-wins over the
+    /// real history on the next recovery.
+    fn initCore(
         allocator: std.mem.Allocator,
         voters: []const u64,
         learners: []const u64,
@@ -942,6 +967,21 @@ pub const GroupedFileStorage = struct {
             .scratch = .empty,
         };
         return self;
+    }
+
+    /// Append the current membership as a confstate WAL record (same payload
+    /// format as `setConfStateCb`; `appendRecord` updates the GC/header cache so
+    /// it survives segment GC). The in-memory ConfState is already set by the
+    /// constructor — this only makes it durable.
+    fn persistConfState(self: *GroupedFileStorage, voters: []const u64, learners: []const u64) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var w = buf.writer(self.allocator);
+        try w.writeInt(u32, @intCast(voters.len), .little);
+        for (voters) |v| try w.writeInt(u64, v, .little);
+        try w.writeInt(u32, @intCast(learners.len), .little);
+        for (learners) |l| try w.writeInt(u64, l, .little);
+        _ = try self.wal.appendRecord(self.group_id, .confstate, buf.items);
     }
 
     pub fn deinit(self: *GroupedFileStorage) void {
@@ -1368,12 +1408,14 @@ test "GroupedFileStorage: each group's appends land in the shared file; per-grou
     // Per-group entry offsets are independent.
     try testing.expectEqual(@as(usize, 2), g1.entry_offsets.items.len);
     try testing.expectEqual(@as(usize, 2), g2.entry_offsets.items.len);
-    // g1's entry starts at 0; g2's starts after g1's full record.
-    try testing.expectEqual(@as(u64, 0), g1.entry_offsets.items[1]);
-    //   g1 record: 13 header + 30 payload + 4 trailer = 47
+    // g1+g2 genesis confstate records (33 B each) precede the entries, so g1's
+    // first entry now starts at 66 (was 0 before genesis-confstate persistence).
+    try testing.expectEqual(@as(u64, 66), g1.entry_offsets.items[1]);
+    //   g1 record: 13 header + 30 payload + 4 trailer = 47; preceded by 66 B of
+    //   g1+g2 genesis confstate records → g2's entry sits at 66 + 47 = 113.
     //   (30 = 4 entry_type + 8 term + 8 index + 4 data_len + 1 data
     //         + 4 context_len + 0 + 1 sync_log)
-    try testing.expectEqual(@as(u64, 47), g2.entry_offsets.items[1]);
+    try testing.expectEqual(@as(u64, 113), g2.entry_offsets.items[1]);
 
     // mem views also independent.
     try testing.expectEqual(@as(u64, 1), g1.mem.lastIndex());
@@ -1436,12 +1478,14 @@ test "GroupedFileStorage: setHardState writes a per-group hardstate record" {
     const hs: c.RaftHardStateFfi = .{ .term = 5, .vote = 3, .commit = 2 };
     try testing.expectEqual(@as(i32, 0), setHardStateCb(g1, &hs));
 
-    // Header (13) + 24 byte hs payload + 4 trailer = 41
-    try testing.expectEqual(@as(u64, 41), wal.wal_offset);
+    // 33 B genesis confstate record + header (13) + 24 B hs payload + 4 trailer = 74
+    try testing.expectEqual(@as(u64, 74), wal.wal_offset);
 
-    // Read back, confirm tag + group_id.
+    // Read back, confirm tag + group_id. Skip the 33 B genesis confstate record
+    // that now precedes the hardstate record on disk.
     const f = try std.fs.cwd().openFile(h.path, .{});
     defer f.close();
+    try f.seekTo(33);
     var buf: [41]u8 = undefined;
     _ = try f.readAll(&buf);
     try testing.expectEqual(@as(u8, @intFromEnum(Tag.hardstate)), buf[0]);
@@ -1477,7 +1521,8 @@ test "SharedWal.flush: a single flush amortizes K groups' writes" {
     // All K records on disk. Each entry record: 13 header + 33 payload
     // + 4 trailer = 50 bytes (33 = 4 entry_type + 8 term + 8 index + 4
     // data_len + 4 data + 4 context_len + 1 sync_log).
-    try testing.expectEqual(@as(u64, K * 50), wal.wal_offset);
+    // + a 33 B genesis confstate record per group → K * (50 + 33).
+    try testing.expectEqual(@as(u64, K * 83), wal.wal_offset);
 }
 
 test "recovery: open on a fresh path yields an empty WAL" {
@@ -1538,7 +1583,8 @@ test "recovery: open rebuilds per-group log + hardstate from a written WAL" {
     // first record in the file.
     try testing.expectEqual(@as(usize, 3), g1.entry_offsets.items.len);
     try testing.expectEqual(@as(usize, 2), g2.entry_offsets.items.len);
-    try testing.expectEqual(@as(u64, 0), g1.entry_offsets.items[1]);
+    // g1's first entry sits after the g1+g2 genesis confstate records (33 B each).
+    try testing.expectEqual(@as(u64, 66), g1.entry_offsets.items[1]);
 
     // Write head sits at the durable prefix end (== file size), so the
     // next append continues the file rather than overwriting it.
@@ -1586,6 +1632,48 @@ test "recovery: a confstate record restores membership (demote) after reopen" {
     defer g.deinit();
     try testing.expectEqualSlices(u64, &.{ 1, 2 }, g.mem.voters.items);
     try testing.expectEqualSlices(u64, &.{3}, g.mem.learners.items);
+}
+
+test "recovery: genesis membership (no conf-change) is LOST — reseeds from the static init voters" {
+    // The complement of the test above. A group BORN with a voter SUBSET ({1,2})
+    // and NO subsequent conf-change writes NO confstate record to the WAL (genesis
+    // membership lives only in volatile MemStorage). On reopen, initRecover is
+    // seeded with the node's STATIC voter set ({1,2,3} — rove passes self.voters =
+    // REWIND_VOTERS), and with no confstate record to override the seed, the group
+    // silently recovers as {1,2,3} ≠ its born {1,2}.
+    //
+    // This is the prod __auth__ premature-fold root cause: born {1,2} (CP cluster
+    // view) on nodes whose REWIND_VOTERS={1,2,3}; rolling restarts flip nodes
+    // {1,2}→{1,2,3} asynchronously → transient per-node membership divergence →
+    // an entry committed under the {1,2,3} view (counting node 3) is not committed
+    // under the {1,2} view → a leader change truncates it → permanent store fork.
+    //
+    // The assertion below states the CORRECT behavior (recover the born {1,2}); it
+    // FAILS on the current code (recovers the seed {1,2,3}), pinning the bug.
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g = try GroupedFileStorage.init(testing.allocator, &.{ 1, 2 }, wal, 7);
+        defer g.deinit();
+        try testing.expectEqualSlices(u64, &.{ 1, 2 }, g.mem.voters.items); // born {1,2}
+        var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "x"), fakeEntry(1, 2, "yy") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+        const hs: c.RaftHardStateFfi = .{ .term = 1, .vote = 1, .commit = 2 };
+        try testing.expectEqual(@as(i32, 0), setHardStateCb(g, &hs));
+        try wal.flush(); // entries + hardstate persisted; NO confstate record.
+    }
+
+    // Restart: seed with the static {1,2,3} (node.zig:initRecover(self.voters,…)).
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    const g = try GroupedFileStorage.initRecover(testing.allocator, &.{ 1, 2, 3 }, wal, 7);
+    defer g.deinit();
+    try testing.expectEqual(@as(u64, 2), g.mem.lastIndex()); // log recovered fine
+    // CORRECT expectation — the born membership must survive recovery:
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, g.mem.voters.items);
 }
 
 test "recovery: a torn (CRC-failed) tail record is dropped and truncated" {
@@ -1668,9 +1756,10 @@ test "recovery: replay reproduces last-authoritative entry after a tail rewrite"
 
     // entry_offsets: sentinel + idx1 + idx2(rewrite). The idx-2 slot
     // points at the 4th (rewrite) record. Each single-byte-data entry
-    // record is 13 + 30 + 4 = 47 bytes, so the rewrite sits at 3*47=141.
+    // record is 13 + 30 + 4 = 47 bytes; + a 33 B genesis confstate record, so the
+    // rewrite sits at 33 + 3*47 = 174.
     try testing.expectEqual(@as(usize, 3), g1.entry_offsets.items.len);
-    try testing.expectEqual(@as(u64, 141), g1.entry_offsets.items[2]);
+    try testing.expectEqual(@as(u64, 174), g1.entry_offsets.items[2]);
 }
 
 test "GroupedFileStorage.compact: drops offset slots in lockstep with mem, advances watermark" {
@@ -1692,7 +1781,8 @@ test "GroupedFileStorage.compact: drops offset slots in lockstep with mem, advan
     // whose slot still points at index 3's record (2 * 47 = 94).
     try testing.expectEqual(@as(usize, 2), g.entry_offsets.items.len);
     try testing.expectEqual(@as(u64, 0), g.entry_offsets.items[0]);
-    try testing.expectEqual(@as(u64, 94), g.entry_offsets.items[1]);
+    // + a 33 B genesis confstate record before the entries → 94 + 33 = 127.
+    try testing.expectEqual(@as(u64, 127), g.entry_offsets.items[1]);
 }
 
 test "segmentation: rolling seals segments; the group keeps its full log" {
@@ -1740,7 +1830,9 @@ test "segment GC: sealed segments are deleted once the group compacts past them"
 test "segment GC: a segment shared with a still-live group is not deleted" {
     var h = try Harness.init();
     defer h.deinit();
-    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 60);
+    // 60 + 66 (g1+g2 genesis confstate records, 33 B each) so the two entries
+    // still share the first segment and the next append rolls it, as before.
+    const wal = try SharedWal.initWithTarget(testing.allocator, h.path, 126);
     defer wal.deinit();
     const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
     defer g1.deinit();
