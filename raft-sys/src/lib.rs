@@ -1618,6 +1618,18 @@ pub unsafe extern "C" fn raft_manager_process_ready(
                 return -4;
             }
         }
+        // Persist the snapshot's ConfState. `restore` installed this membership
+        // in raft's in-memory state, but `apply_snapshot` records only the LOG
+        // baseline + a compaction marker — NOT the membership. Without this, the
+        // post-restore voter set is lost on restart: `initRecover` reseeds from
+        // the static voter set and the node silently changes membership (the same
+        // bug class as a never-persisted genesis ConfState). Mirrors the
+        // conf-change persist path below.
+        persist_conf_state(
+            vtable_ptr,
+            store_userdata,
+            snap.get_metadata().get_conf_state(),
+        );
     }
 
     // Persist hard state.

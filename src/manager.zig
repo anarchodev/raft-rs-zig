@@ -1106,6 +1106,53 @@ test "HardState.commit: compact-then-recover round-trips and re-opens" {
     try testing.expect(mgr.groupCount() == 1);
 }
 
+test "recovery: a snapshot's ConfState is persisted (membership SSOT survives restart)" {
+    // Instance #2 of the "recovery-critical state must be durable" class (the
+    // genesis-ConfState fix is instance #1). A node that joins via an out-of-band
+    // baseline (rove move / catch-up / reconciler bootstrap) learns the leader's
+    // membership from the snapshot's ConfState; raft's `restore` installs it in
+    // memory, but `apply_snapshot` records only the LOG baseline. process_ready
+    // must ALSO persist the snapshot's ConfState (set_conf_state) — else the
+    // membership is lost on restart: initRecover reseeds from the static voter set
+    // and the group silently changes membership (the __auth__ fork class).
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    {
+        const wal = try SharedWal.init(a, wal_path);
+        defer wal.deinit();
+        // Born {1,2}; node 1 is a FOLLOWER (never campaigns), so it can install a
+        // baseline — a leader cannot restore a snapshot to itself.
+        const gfs = try GroupedFileStorage.init(a, &.{ 1, 2 }, wal, 1);
+        var mgr = try Manager.init();
+        defer mgr.deinit();
+        try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+        // Install a baseline whose ConfState ADDS node 3 → membership {1,2,3},
+        // different from the born {1,2}. (Node 1 is in the new set, so restore
+        // keeps the baseline rather than discarding it.)
+        try mgr.applyLocalSnapshot(1, 5, 2, &.{ 1, 2, 3 }, null);
+        HsReproApply.reset();
+        try hsReproPump(&mgr, wal); // process_ready installs + persists the ConfState
+        try wal.flush();
+        // In-memory membership now reflects the baseline (proves set_conf_state ran).
+        try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, gfs.mem.voters.items);
+    }
+
+    // Restart: seed initRecover with the BORN {1,2}, deliberately ≠ the baseline's
+    // {1,2,3}. The baseline's ConfState must win (it was persisted), NOT the seed.
+    // Without the fix this recovers {1,2} (the seed); with it, {1,2,3}.
+    const wal = try SharedWal.open(a, wal_path);
+    defer wal.deinit();
+    const gfs2 = try GroupedFileStorage.initRecover(a, &.{ 1, 2 }, wal, 1);
+    defer gfs2.deinit();
+    try testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, gfs2.mem.voters.items);
+}
+
 // ── Threaded group-creation repro (BUG-e2c4aea-process-ready-confchange-gpf) ──
 //
 // The bug report claims a threaded host SIGSEGVs in `confchange::restore`
