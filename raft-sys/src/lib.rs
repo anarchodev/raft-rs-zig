@@ -1569,6 +1569,21 @@ pub unsafe extern "C" fn raft_manager_is_leader(m: *const RaftManager, group_id:
         .unwrap_or(false)
 }
 
+/// The raft id this group currently believes is the leader, or 0 when
+/// unknown (mid-election, freshly formed, or — on a partitioned follower —
+/// no recent leader contact). On a follower this is the leader it follows;
+/// on the leader it is its own id. Lets the data plane answer "who should I
+/// redirect a not-leader write to" instead of only "am I the leader". 0 for
+/// an unknown group id.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_leader_id(m: *const RaftManager, group_id: u64) -> u64 {
+    let mgr = &*m;
+    mgr.groups
+        .get(&group_id)
+        .map(|s| s.node.raft.leader_id)
+        .unwrap_or(0)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_process_ready(
     m: *mut RaftManager,

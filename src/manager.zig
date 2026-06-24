@@ -546,6 +546,15 @@ pub const Manager = struct {
         return c.raft_manager_is_leader(self.ptr, group_id);
     }
 
+    /// The raft id this group currently believes leads it, or 0 when unknown
+    /// (mid-election / freshly formed / no recent leader contact). On a
+    /// follower this is the leader it follows; on the leader, its own id. Lets
+    /// a not-leader node answer "who should the caller redirect to" rather than
+    /// only "am I the leader" (`isLeader`). 0 for an unknown group id.
+    pub fn leaderId(self: *const Manager, group_id: u64) u64 {
+        return c.raft_manager_leader_id(self.ptr, group_id);
+    }
+
     pub fn groupCount(self: *const Manager) usize {
         return c.raft_manager_group_count(self.ptr);
     }
