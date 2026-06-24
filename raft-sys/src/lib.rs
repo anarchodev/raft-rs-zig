@@ -462,6 +462,25 @@ pub struct RaftManager {
     /// the per-id ops tolerate "unknown group" as a no-op.
     pending: Mutex<VecDeque<u64>>,
     logger: Logger,
+    /// Optional observer fired once per COMMITTED conf-change as it applies in
+    /// `process_ready` — on EVERY replica, not just the proposing leader. The
+    /// caller uses it to learn the changing node's transport address (carried as
+    /// the conf-change ENTRY context by `raft_manager_propose_conf_change`) so the
+    /// id→address mapping rides the replicated log exactly like the membership
+    /// itself, instead of being learned out-of-band point-to-point. `None` =
+    /// no observer (the historical behaviour).
+    cc_observer: Option<ConfChangeObserver>,
+}
+
+/// `(userdata, cb)` for the committed-conf-change observer. fn-ptr + raw ptr are
+/// `Copy`, so the apply loop snapshots this out before borrowing a group slot.
+#[derive(Clone, Copy)]
+struct ConfChangeObserver {
+    userdata: *mut c_void,
+    /// `(userdata, node_id, context_ptr, context_len)`. `context` is the
+    /// conf-change entry context the proposer attached (empty for a
+    /// remove/demote, or a change proposed without one).
+    cb: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize),
 }
 
 /// CAS-flip a slot from IDLE→NOTIFIED. On success push the
@@ -490,6 +509,21 @@ fn notify_locked(slot_state: &AtomicU8, pending: &Mutex<VecDeque<u64>>, group_id
     }
 }
 
+/// Register the committed-conf-change observer (see `RaftManager.cc_observer`).
+/// `cb(userdata, node_id, context_ptr, context_len)` fires once per committed
+/// conf-change as it applies on THIS node — on every replica — so the caller can
+/// learn the node's address from the entry context the proposer attached.
+/// Idempotent; pass a null `cb` is UB (caller must pass a real fn). Call once at
+/// setup, before the pump drives `process_ready`.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_set_conf_change_observer(
+    m: *mut RaftManager,
+    userdata: *mut c_void,
+    cb: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize),
+) {
+    (&mut *m).cc_observer = Some(ConfChangeObserver { userdata, cb });
+}
+
 #[no_mangle]
 pub extern "C" fn raft_manager_new() -> *mut RaftManager {
     Box::into_raw(Box::new(RaftManager {
@@ -497,6 +531,7 @@ pub extern "C" fn raft_manager_new() -> *mut RaftManager {
         tombstones: HashSet::new(),
         pending: Mutex::new(VecDeque::new()),
         logger: Logger::root(Discard, o!()),
+        cc_observer: None,
     }))
 }
 
@@ -910,6 +945,11 @@ pub unsafe extern "C" fn raft_manager_propose_conf_change(
     group_id: u64,
     node_id: u64,
     change_type: u8,
+    // Optional entry context replicated WITH the committed conf-change (e.g. the
+    // joining node's transport address). Surfaced on every replica via the
+    // `cc_observer` as the change applies. NULL / 0-len = no context (historical).
+    context: *const u8,
+    context_len: usize,
 ) -> i32 {
     let mgr = &mut *m;
     let pending = &mgr.pending;
@@ -943,7 +983,12 @@ pub unsafe extern "C" fn raft_manager_propose_conf_change(
     single.set_change_type(cc_type);
     let mut cc = ConfChangeV2::default();
     cc.set_changes(vec![single].into());
-    match slot.node.propose_conf_change(vec![], cc) {
+    let ctx: Vec<u8> = if context.is_null() || context_len == 0 {
+        vec![]
+    } else {
+        slice::from_raw_parts(context, context_len).to_vec()
+    };
+    match slot.node.propose_conf_change(ctx, cc) {
         Ok(()) => {
             notify_locked(&slot.state, pending, group_id);
             0
@@ -1592,6 +1637,10 @@ pub unsafe extern "C" fn raft_manager_process_ready(
     userdata: *mut c_void,
 ) -> i32 {
     let mgr = &mut *m;
+    // Snapshot the conf-change observer (Copy) BEFORE the mutable `slot` borrow
+    // below — the committed-conf-change apply loop fires it, and it can't
+    // re-borrow `mgr` while `slot` is held.
+    let cc_observer = mgr.cc_observer;
     // Stale id (group destroyed between notify and drain) → no-op.
     // The ready-channel design guarantees the caller may see ids
     // for groups that have since vanished; treating that as success
@@ -1760,37 +1809,55 @@ pub unsafe extern "C" fn raft_manager_process_ready(
         // committed entry is by definition well-formed) — it is deterministic
         // across replicas so it does not diverge them, but it must not be a SILENT
         // skip. Fail loud to stderr; the membership simply isn't advanced.
-        let cs = match entry.get_entry_type() {
+        // `cc_node_id` is the change's target node id (for the observer below);
+        // `None` when there's no single change to attribute (decode/apply error).
+        let (cs, cc_node_id): (Option<ConfState>, Option<u64>) = match entry.get_entry_type() {
             EntryType::EntryConfChange => match ConfChange::parse_from_bytes(&entry.data) {
-                Ok(cc) => match slot.node.apply_conf_change(&cc) {
-                    Ok(cs) => Some(cs),
-                    Err(e) => {
-                        eprintln!("raft-sys: BUG apply_conf_change failed on committed entry (group {}): {}", group_id, e);
-                        None
+                Ok(cc) => {
+                    let nid = cc.node_id;
+                    match slot.node.apply_conf_change(&cc) {
+                        Ok(cs) => (Some(cs), Some(nid)),
+                        Err(e) => {
+                            eprintln!("raft-sys: BUG apply_conf_change failed on committed entry (group {}): {}", group_id, e);
+                            (None, None)
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     eprintln!("raft-sys: BUG failed to decode committed ConfChange (group {}): {}", group_id, e);
-                    None
+                    (None, None)
                 }
             },
             EntryType::EntryConfChangeV2 => match ConfChangeV2::parse_from_bytes(&entry.data) {
-                Ok(cc) => match slot.node.apply_conf_change(&cc) {
-                    Ok(cs) => Some(cs),
-                    Err(e) => {
-                        eprintln!("raft-sys: BUG apply_conf_change(V2) failed on committed entry (group {}): {}", group_id, e);
-                        None
+                Ok(cc) => {
+                    // rove proposes single-change V2 conf-changes; attribute the
+                    // context to that one change's node id.
+                    let nid = cc.changes.first().map(|c| c.node_id);
+                    match slot.node.apply_conf_change(&cc) {
+                        Ok(cs) => (Some(cs), nid),
+                        Err(e) => {
+                            eprintln!("raft-sys: BUG apply_conf_change(V2) failed on committed entry (group {}): {}", group_id, e);
+                            (None, None)
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     eprintln!("raft-sys: BUG failed to decode committed ConfChangeV2 (group {}): {}", group_id, e);
-                    None
+                    (None, None)
                 }
             },
-            _ => None,
+            _ => (None, None),
         };
         if let Some(cs) = cs {
             persist_conf_state(vtable_ptr, store_userdata, &cs);
+        }
+        // Fire the conf-change observer with the change's node id + the entry
+        // CONTEXT the proposer attached (the node's transport address). Runs on
+        // EVERY replica as the change applies, so the id→address mapping rides
+        // the replicated log. Only when a single node id was attributed.
+        if let (Some(obs), Some(nid)) = (cc_observer, cc_node_id) {
+            let ctx = entry.get_context();
+            (obs.cb)(obs.userdata, nid, ctx.as_ptr(), ctx.len());
         }
     }
 

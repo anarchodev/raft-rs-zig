@@ -290,8 +290,20 @@ pub const Manager = struct {
     /// when the entry commits, via `processReady`. Pump-thread only.
     /// `Error.NotLeader` off-leader; `Error.ConfChangeQuorumGuard` if a
     /// demote/remove would drop below 2 voters.
-    pub fn proposeConfChange(self: *Manager, group_id: u64, node: u64, change: ConfChange) Error!void {
-        const rc = c.raft_manager_propose_conf_change(self.ptr, group_id, node, @intFromEnum(change));
+    ///
+    /// `context` is replicated WITH the committed conf-change entry and surfaced
+    /// on every replica via `setConfChangeObserver` as the change applies — the
+    /// caller uses it to carry the changing node's transport address so the
+    /// id→address map rides the log like the membership. Empty = no context.
+    pub fn proposeConfChange(self: *Manager, group_id: u64, node: u64, change: ConfChange, context: []const u8) Error!void {
+        const rc = c.raft_manager_propose_conf_change(
+            self.ptr,
+            group_id,
+            node,
+            @intFromEnum(change),
+            if (context.len > 0) context.ptr else null,
+            context.len,
+        );
         return switch (rc) {
             0 => {},
             -1 => Error.UnknownGroup, // the bhs-3 id-drift signal — must NOT look like a transient ProposeFailed
@@ -299,6 +311,30 @@ pub const Manager = struct {
             -4 => Error.ConfChangeQuorumGuard,
             else => Error.ProposeFailed,
         };
+    }
+
+    /// The committed-conf-change observer: `fn(ctx, node_id, context_bytes)`.
+    /// `context_bytes` aliases raft-owned memory valid only for the callback.
+    pub const ConfChangeObserver = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, node_id: u64, context: []const u8) void,
+    };
+
+    /// Register a `ConfChangeObserver` fired once per committed conf-change as it
+    /// applies on THIS node — on every replica — during `processReady`. The
+    /// caller learns the changing node's address from the entry context the
+    /// proposer attached. `obs` is CALLER-OWNED and must outlive the manager (a
+    /// `Manager` is a by-value handle, so it can't safely store the observer
+    /// inline). Call once at setup, before the pump runs.
+    pub fn setConfChangeObserver(self: *Manager, obs: *const ConfChangeObserver) void {
+        const Trampoline = struct {
+            fn cb(ud: ?*anyopaque, node_id: u64, ctx_ptr: ?[*]const u8, ctx_len: usize) callconv(.c) void {
+                const o: *const ConfChangeObserver = @ptrCast(@alignCast(ud.?));
+                const bytes: []const u8 = if (ctx_ptr) |p| p[0..ctx_len] else &.{};
+                o.func(o.ctx, node_id, bytes);
+            }
+        };
+        c.raft_manager_set_conf_change_observer(self.ptr, @constCast(obs), Trampoline.cb);
     }
 
     pub const ConfStateView = struct { voters: []const u64, learners: []const u64 };
@@ -972,6 +1008,63 @@ fn hsReproPump(mgr: *Manager, wal: *SharedWal) !void {
             mgr.release(g);
         }
     }
+}
+
+const CcObs = struct {
+    var node_id: u64 = 0;
+    var ctx_buf: [64]u8 = undefined;
+    var ctx_len: usize = 0;
+    var fired: u32 = 0;
+    fn reset() void {
+        node_id = 0;
+        ctx_len = 0;
+        fired = 0;
+    }
+    fn observe(_: *anyopaque, nid: u64, context: []const u8) void {
+        node_id = nid;
+        ctx_len = @min(context.len, ctx_buf.len);
+        @memcpy(ctx_buf[0..ctx_len], context[0..ctx_len]);
+        fired += 1;
+    }
+};
+
+test "Manager: conf-change observer fires on apply with the entry context" {
+    // The address-rides-the-log contract: a conf-change proposed with a context
+    // surfaces that context — on the applying node — via the observer, keyed by
+    // the change's node id. (In rove the context is the joining node's transport
+    // address, so every replica learns id→addr as the membership change applies.)
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(a, ".");
+    defer a.free(path);
+    const wal_path = try std.fmt.allocPrint(a, "{s}/wal", .{path});
+    defer a.free(wal_path);
+
+    const wal = try SharedWal.init(a, wal_path);
+    defer wal.deinit();
+    const gfs = try GroupedFileStorage.init(a, &.{1}, wal, 1);
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+
+    CcObs.reset();
+    var dummy: u8 = 0;
+    const obs = Manager.ConfChangeObserver{ .ctx = &dummy, .func = CcObs.observe };
+    mgr.setConfChangeObserver(&obs);
+
+    try mgr.createGroup(1, 1, grouped_file_storage_vtable, gfs);
+    try mgr.campaign(1);
+    HsReproApply.reset();
+    try hsReproPump(&mgr, wal); // elect
+    try testing.expect(mgr.isLeader(1));
+
+    // Add node 2 as a learner, carrying its address as the conf-change context.
+    try mgr.proposeConfChange(1, 2, .add_learner, "10.0.0.2:9001");
+    try hsReproPump(&mgr, wal); // commit + apply → observer fires on this node
+
+    try testing.expect(CcObs.fired >= 1);
+    try testing.expectEqual(@as(u64, 2), CcObs.node_id);
+    try testing.expectEqualStrings("10.0.0.2:9001", CcObs.ctx_buf[0..CcObs.ctx_len]);
 }
 
 test "async-append: commit waits for the persist ack (no quorum from volatile entries)" {
