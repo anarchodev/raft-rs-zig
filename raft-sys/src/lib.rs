@@ -11,6 +11,7 @@ use raft::prelude::*;
 use raft::storage::Storage;
 use raft::{
     Config, GetEntriesContext, ProgressState, RaftState, RawNode, ReadOnlyOption, StateRole,
+    CAMPAIGN_TRANSFER,
 };
 use slog::{o, Discard, Logger};
 
@@ -816,6 +817,67 @@ pub unsafe extern "C" fn raft_manager_campaign(m: *mut RaftManager, group_id: u6
         },
         None => -1,
     }
+}
+
+/// Force an election on `group_id` that BYPASSES peers' `check_quorum` leader
+/// leases — the recovery primitive for a hibernated survivor after a HARD
+/// (SIGKILL, no graceful handoff) leader loss. Unlike `raft_manager_campaign`
+/// (`RawNode::campaign` = `hup(false)`: a normal pre-vote election), the vote
+/// requests this produces carry the `CAMPAIGN_TRANSFER` context, so a receiver
+/// computes `force = true` and SKIPS the `in_lease` ignore (raft.rs: a follower
+/// whose `election_elapsed` froze below the election timeout while `leader_id`
+/// still points at the now-dead leader otherwise drops the vote). It also skips
+/// pre-vote (a transfer never pre-votes), cutting one round trip.
+///
+/// Why `raft.campaign(CAMPAIGN_TRANSFER)` directly and NOT a self-stepped
+/// `MsgTimeoutNow`: a node stuck re-pre-voting sits as `PreCandidate`, and
+/// `step_candidate` IGNORES `MsgTimeoutNow` (only a `Follower` honours it), so a
+/// stepped timeout would no-op on exactly the node that needs to be unstuck.
+/// `campaign` drives `become_candidate` from ANY non-leader state.
+///
+/// Guards: a leader is a no-op (returns 0). A non-voter (learner) is refused
+/// (returns 0) — a learner must never campaign. A pending (committed-but-
+/// unapplied) conf-change is refused (returns 0): electing under a membership
+/// mid-change is unsafe — this mirrors `hup`'s `num_pending_conf` check (rove's
+/// pump applies committed conf-changes within a cycle, so by the time the
+/// leaderless-escalation caller invokes this the guard is ~always clear; it is a
+/// safety backstop).
+///
+/// Caller contract: invoke ONLY when the group is genuinely leaderless (this
+/// node is not the leader and `raft_manager_leader_id` is 0). Forcing past the
+/// lease while a healthy leader exists would reintroduce the disruptive-server
+/// problem the lease prevents.
+///
+/// Returns 0 (election started, or a guarded no-op), -1 unknown group.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_campaign_force(m: *mut RaftManager, group_id: u64) -> i32 {
+    let mgr = &mut *m;
+    let pending = &mgr.pending;
+    let slot = match mgr.groups.get_mut(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    if slot.node.raft.state == StateRole::Leader {
+        return 0; // already leader — nothing to force
+    }
+    let self_id = slot.node.raft.id;
+    // Voter-only: a learner must never campaign.
+    if !slot.node.raft.prs().conf().voters().contains(self_id) {
+        return 0;
+    }
+    // Pending-conf-change backstop (mirrors `hup`): never campaign while a
+    // committed conf-change is still unapplied.
+    {
+        let r = &slot.node.raft;
+        if r.pending_conf_index > r.raft_log.applied
+            && r.pending_conf_index <= r.raft_log.committed
+        {
+            return 0;
+        }
+    }
+    slot.node.raft.campaign(CAMPAIGN_TRANSFER);
+    notify_locked(&slot.state, pending, group_id);
+    0
 }
 
 /// Graceful leadership handoff: if this node is the leader of `group_id`,

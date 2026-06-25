@@ -247,6 +247,18 @@ pub const Manager = struct {
         if (c.raft_manager_campaign(self.ptr, group_id) != 0) return Error.CampaignFailed;
     }
 
+    /// Force an election on `group_id` that bypasses peers' `check_quorum`
+    /// leases — the recovery primitive for a hibernated survivor after a HARD
+    /// (SIGKILL) leader loss, where a normal campaign's votes are ignored by
+    /// frozen followers whose lease has not visibly expired. Drives
+    /// `Raft::campaign(CAMPAIGN_TRANSFER)` (forced, pre-vote-free). Safe no-op
+    /// on a leader, a learner, or a group with a pending conf-change. Call ONLY
+    /// when genuinely leaderless (`leaderId == 0`); pump-thread only. -1 (unknown
+    /// group) is swallowed — a stale gid is a no-op, like the other per-id ops.
+    pub fn campaignForce(self: *Manager, group_id: u64) void {
+        _ = c.raft_manager_campaign_force(self.ptr, group_id);
+    }
+
     /// Graceful pre-shutdown leadership handoff: if this node leads
     /// `group_id`, transfer leadership to the most caught-up follower
     /// (voter) so a rolling restart costs ~one heartbeat instead of a full
