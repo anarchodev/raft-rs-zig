@@ -1144,6 +1144,30 @@ pub unsafe extern "C" fn raft_manager_last_index(
     0
 }
 
+/// This group's first (uncompacted) log index — the lowest index the local
+/// raft_log still holds. Entries below it were compacted after being applied
+/// and snapshotted. The promotion-time LogRecord walker starts here and walks
+/// forward to `last_index`, re-deriving every log record still recoverable from
+/// the live log (the idempotent log indexer dedups any the dead leader already
+/// flushed). Returns 0 on success, -1 unknown group. Read-only.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_first_index(
+    m: *const RaftManager,
+    group_id: u64,
+    out_first: *mut u64,
+) -> i32 {
+    if m.is_null() || out_first.is_null() {
+        return -1;
+    }
+    let mgr = &*m;
+    let slot = match mgr.groups.get(&group_id) {
+        Some(s) => s,
+        None => return -1,
+    };
+    *out_first = slot.node.raft.raft_log.first_index();
+    0
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_voter_progress(
     m: *const RaftManager,
