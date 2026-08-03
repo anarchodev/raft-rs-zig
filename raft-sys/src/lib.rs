@@ -10,7 +10,7 @@ use raft::eraftpb::{ConfState, HardState, Snapshot, SnapshotMetadata};
 use raft::prelude::*;
 use raft::storage::Storage;
 use raft::{
-    Config, GetEntriesContext, ProgressState, RaftState, RawNode, ReadOnlyOption, StateRole,
+    Config, GetEntriesContext, RaftState, RawNode, ReadOnlyOption, StateRole,
     CAMPAIGN_TRANSFER,
 };
 use slog::{o, Discard, Logger};
@@ -1958,11 +1958,30 @@ pub unsafe extern "C" fn raft_manager_process_ready(
 
     push_messages(&mut slot.outbox, ready_msgs);
 
-    // Hold the persistence-asserting messages until the fsync; an
-    // empty stash entry still records the number so `on_persist`
-    // acks every ready in order.
-    let mut stashed: Vec<(u64, Vec<u8>)> = Vec::with_capacity(persisted_msgs.len());
-    push_messages(&mut stashed, persisted_msgs);
+    // Hold the persistence-asserting messages until the fsync — EXCEPT
+    // heartbeat responses, which assert nothing about local durability and
+    // leave immediately. raft-rs gates a non-leader ready's ENTIRE message
+    // batch on persistence (`Ready.is_persisted_msg = state != Leader`), a
+    // per-role blanket that is coarser than the per-type split etcd/raft
+    // ships (only MsgAppResp / MsgVoteResp / MsgPreVoteResp wait in its
+    // `msgsAfterAppend`). The blanket is not just conservative — it is a
+    // liveness hazard: a follower under write load always has an appended-
+    // unpersisted tail, so its MsgHeartbeatResponse sits in the stash for
+    // the full WAL-fsync latency and the follower is heartbeat-SILENT
+    // toward the leader for that window. A leader whose check_quorum
+    // election window elapses inside one shared fsync stall (every follower
+    // silent at once) deposes itself — a spurious election under load with
+    // zero real failures. Append acks and (pre-)vote responses DO assert
+    // durable state and stay gated.
+    let (hb_resps, gated): (Vec<Message>, Vec<Message>) = persisted_msgs
+        .into_iter()
+        .partition(|msg| msg.get_msg_type() == MessageType::MsgHeartbeatResponse);
+    push_messages(&mut slot.outbox, hb_resps);
+
+    // An empty stash entry still records the number so `on_persist` acks
+    // every ready in order.
+    let mut stashed: Vec<(u64, Vec<u8>)> = Vec::with_capacity(gated.len());
+    push_messages(&mut stashed, gated);
     slot.pending_persist.push((ready_number, stashed));
 
     0
