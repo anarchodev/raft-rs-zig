@@ -1414,9 +1414,7 @@ pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     if slot.node.raft.state == StateRole::Leader {
         return -2;
     }
-    if index <= slot.node.raft.raft_log.committed {
-        return -3;
-    }
+    let stale = index <= slot.node.raft.raft_log.committed;
     // A baseline at index>committed (so index>0) MUST carry a real term. A term-0
     // baseline makes raft's `restore` fast-forward commit_to past an empty log →
     // fatal!, and with panic=abort that takes down EVERY tenant on this node. The
@@ -1427,6 +1425,24 @@ pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     }
     let self_id = slot.node.raft.id;
     let cur_term = slot.node.raft.term;
+    // Address the synthetic MsgSnapshot FROM THE LEADER (when known), exactly as
+    // if the leader had sent it: `handle_snapshot` replies MsgAppendResponse to
+    // `m.from` on BOTH outcomes — restored (index = new last) and ignored/stale
+    // (index = committed) — so the follower's position flows back to the leader
+    // over the transport. An out-of-band install has no `report_snapshot`, and
+    // without this announce the leader can wedge permanently: a below-floor
+    // peer's Progress.next converges under the compaction floor, the snapshot-
+    // free storage refuses every prepare_send_snapshot, and no append can ever
+    // be sent again — the peer's install is invisible and `matched` sticks
+    // forever (the freshly-added empty learner hits this deterministically).
+    // Leader unknown (0) falls back to self — a local no-op announce, retried
+    // convergently: the trigger re-streams, the install lands here as `stale`,
+    // and by then heartbeats have taught the follower its leader.
+    let leader_id = slot.node.raft.leader_id;
+    let announce_from = if leader_id != 0 { leader_id } else { self_id };
+    if stale && leader_id == 0 {
+        return -3; // nothing to announce to; the caller's retry path covers it
+    }
     // The ConfState the baseline carries. Caller-supplied (membership SSOT) when
     // `voters` is non-null; otherwise the group's CURRENT prs (membership-neutral
     // promote-back). `restore` rebuilds the group's membership from this.
@@ -1462,15 +1478,32 @@ pub unsafe extern "C" fn raft_manager_apply_local_snapshot(
     let mut msg = Message::default();
     msg.set_msg_type(MessageType::MsgSnapshot);
     msg.set_to(self_id);
-    msg.set_from(self_id);
+    msg.set_from(announce_from);
     msg.set_term(cur_term);
     msg.set_snapshot(snap);
+    // A stale baseline (index <= committed) is still STEPPED (never restored:
+    // `restore` refuses index < committed, and index == committed either
+    // fast-forwards commit — a no-op here — or re-installs the identical
+    // state), because the step's "ignored snapshot" reply is the announce that
+    // exits the leader-side wedge when an earlier install raced ahead of the
+    // leader learning about it. The caller still sees -3 (SnapshotStale) so
+    // its already-ahead handling is unchanged.
     match slot.node.step(msg) {
         Ok(()) => {
             notify_locked(&slot.state, &mgr.pending, group_id);
-            0
+            if stale {
+                -3
+            } else {
+                0
+            }
         }
-        Err(_) => -4,
+        Err(_) => {
+            if stale {
+                -3
+            } else {
+                -4
+            }
+        }
     }
 }
 
