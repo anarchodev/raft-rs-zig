@@ -612,6 +612,16 @@ pub const Manager = struct {
         return c.raft_manager_leader_id(self.ptr, group_id);
     }
 
+    /// The group's current raft term, or 0 for an unknown group id (a real
+    /// group's term is never 0 once it has run an election). Strictly
+    /// increases across leadership acquisitions — every election bumps it,
+    /// and leadership is never resumed without an election — so it fences
+    /// leader-scoped volatile counters that must never repeat a value
+    /// handed out under an earlier leadership of the same group.
+    pub fn currentTerm(self: *const Manager, group_id: u64) u64 {
+        return c.raft_manager_current_term(self.ptr, group_id);
+    }
+
     pub fn groupCount(self: *const Manager) usize {
         return c.raft_manager_group_count(self.ptr);
     }
@@ -840,6 +850,22 @@ test "Manager: take_messages drains the outbox after a campaign (multi-node sani
     try testing.expectEqual(@as(u64, 2), MsgCollector.last_to);
     try testing.expect(MsgCollector.count >= 1);
     try testing.expect(MsgCollector.snapshot().len > 0);
+}
+
+test "Manager: currentTerm reads 0 for unknown groups, the elected term once leader" {
+    var mgr = try Manager.init();
+    defer mgr.deinit();
+
+    try testing.expectEqual(@as(u64, 0), mgr.currentTerm(99));
+
+    const storage = try MemStorage.init(testing.allocator, &.{1});
+    try mgr.createGroup(1, 1, storage_vtable, storage);
+    const before = mgr.currentTerm(1);
+
+    // A single-voter campaign wins on the self-vote within the call.
+    try mgr.campaign(1);
+    try testing.expect(mgr.isLeader(1));
+    try testing.expect(mgr.currentTerm(1) > before);
 }
 
 test "Manager: step rejects garbage bytes with StepDecodeFailed" {
