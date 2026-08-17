@@ -1748,6 +1748,21 @@ pub unsafe extern "C" fn raft_manager_leader_id(m: *const RaftManager, group_id:
         .unwrap_or(0)
 }
 
+/// The group's current raft term, or 0 for an unknown group id (a real
+/// group's term is never 0 once it has run an election). The term strictly
+/// increases across leadership acquisitions — every election bumps it, and
+/// leadership is never resumed without an election — so it serves as a
+/// fence for leader-scoped volatile counters that must never repeat a value
+/// handed out under an earlier leadership of the same group.
+#[no_mangle]
+pub unsafe extern "C" fn raft_manager_current_term(m: *const RaftManager, group_id: u64) -> u64 {
+    let mgr = &*m;
+    mgr.groups
+        .get(&group_id)
+        .map(|s| s.node.raft.term)
+        .unwrap_or(0)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn raft_manager_process_ready(
     m: *mut RaftManager,
