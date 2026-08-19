@@ -135,10 +135,23 @@ pub const Error = error{
 /// group's destroy-vtable callback.
 pub const Manager = struct {
     ptr: *c.RaftManager,
+    /// Optional debug guard on the caller's durability contract — see
+    /// `onPersist` and `storage.DurabilityWitness`. Null leaves the old
+    /// unchecked behaviour, so wiring it is additive.
+    durability_witness: ?storage_mod.DurabilityWitness = null,
 
     pub fn init() Error!Manager {
         const p = c.raft_manager_new() orelse return Error.ManagerInitFailed;
         return .{ .ptr = p };
+    }
+
+    /// Wire the WAL whose fsync backs `onPersist` (`SharedWal.durabilityWitness`).
+    /// Callers running the standard pump should set this: it costs one boolean
+    /// read per `onPersist` in safe builds and nothing in ReleaseFast, and it
+    /// is the only thing standing between a mis-ordered pump and a commit
+    /// quorum counting entries that were never fsynced.
+    pub fn setDurabilityWitness(self: *Manager, witness: storage_mod.DurabilityWitness) void {
+        self.durability_witness = witness;
     }
 
     pub fn deinit(self: *Manager) void {
@@ -580,7 +593,24 @@ pub const Manager = struct {
     /// readiness again: a persist ack commonly unlocks a commit
     /// advance with committed entries to apply (the group re-enters
     /// the ready channel). Unknown group / nothing pending = no-op.
+    ///
+    /// The witness (when wired) asserts what this function's contract asks
+    /// for and cannot otherwise check: that the caller's fsync already
+    /// covered the appends it is acking. Acking early does not fail
+    /// visibly — it makes this node's unflushed entries count toward the
+    /// commit quorum, so the cluster commits data that a power cut can take
+    /// back. Safe builds only; `runtime_safety` is off in ReleaseFast.
     pub fn onPersist(self: *Manager, group_id: u64) void {
+        if (std.debug.runtime_safety) {
+            if (self.durability_witness) |w| {
+                if (w.dirty()) std.debug.panic(
+                    "raft manager: onPersist(group {d}) with un-fsynced WAL appends outstanding — " ++
+                        "the pump must flush between processReady and onPersist, or a commit quorum " ++
+                        "counts volatile entries",
+                    .{group_id},
+                );
+            }
+        }
         _ = c.raft_manager_on_persist(self.ptr, group_id);
     }
 
