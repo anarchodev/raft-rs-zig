@@ -126,6 +126,14 @@ fn store_unavailable() -> raft::Error {
 /// the requested index/range is below first_index — the entries were
 /// compacted away, so raft must fall back to a snapshot (Compacted is a
 /// very different signal from Unavailable, which means "not yet here").
+///
+/// EVERY fallible storage callback routes through here. `initial_state`,
+/// `first_index` and `last_index` used to hardcode `Unavailable`, so a
+/// storage impl reporting "compacted" from one of them was silently
+/// downgraded to "not yet here" — which flips raft's snapshot-vs-retry
+/// decision without a trace. The Zig `MemStorage` never returns -2 from
+/// those three today, so this is a no-op for the shipped storage and
+/// purely the removal of a trap for the next one.
 fn store_err_from_rc(rc: i32) -> raft::Error {
     if rc == -2 {
         raft::Error::Store(raft::StorageError::Compacted)
@@ -159,7 +167,7 @@ impl Storage for FfiStorage {
         };
         let rc = unsafe { cb(self.userdata, &mut hs, &mut cs) };
         if rc != 0 {
-            return Err(store_unavailable());
+            return Err(store_err_from_rc(rc));
         }
         let mut hard_state = HardState::default();
         hard_state.set_term(hs.term);
@@ -268,7 +276,7 @@ impl Storage for FfiStorage {
         let mut out = 0u64;
         let rc = unsafe { cb(self.userdata, &mut out) };
         if rc != 0 {
-            return Err(store_unavailable());
+            return Err(store_err_from_rc(rc));
         }
         Ok(out)
     }
@@ -278,7 +286,7 @@ impl Storage for FfiStorage {
         let mut out = 0u64;
         let rc = unsafe { cb(self.userdata, &mut out) };
         if rc != 0 {
-            return Err(store_unavailable());
+            return Err(store_err_from_rc(rc));
         }
         Ok(out)
     }

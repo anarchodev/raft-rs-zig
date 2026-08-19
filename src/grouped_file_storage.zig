@@ -209,6 +209,14 @@ pub const SharedWal = struct {
     /// bucket in `GroupedFileStorage.initRecover`; `deinit` frees any
     /// bucket that was never drained.
     recovered: std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
+    /// Records appended since the last successful `flush` — i.e. bytes that
+    /// are in the page cache and would be lost to a power cut. Read through
+    /// `durabilityWitness`; see `DurabilityWitness` for what it guards.
+    /// CRC-valid records `open` found whose fixed-size payload was the wrong
+    /// length. Non-zero means this WAL holds records written by a build that
+    /// predates the append-path reject, or corruption that passed CRC — either
+    /// way the operator wants to know, so the boot caller escalates this.
+    malformed_records: usize = 0,
 
     /// Fresh start with the default segment size.
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) !*SharedWal {
@@ -299,6 +307,7 @@ pub const SharedWal = struct {
         errdefer compaction_cache.deinit();
         var confstate_cache = std.AutoHashMap(u64, []u8).init(allocator);
         errdefer freeConfstateCache(allocator, &confstate_cache);
+        var malformed: usize = 0;
 
         const seg_nos = try discoverSealedSegments(allocator, wal_path);
         defer allocator.free(seg_nos);
@@ -314,7 +323,7 @@ pub const SharedWal = struct {
             const p = try sealedSegmentPath(&pbuf, wal_path, sn);
             const f = try std.fs.cwd().openFile(p, .{});
             defer f.close();
-            _ = try scanForReplay(allocator, f, &recovered, &gm, &hardstate_cache, &compaction_cache, &confstate_cache);
+            _ = try scanForReplay(allocator, f, &recovered, &gm, &hardstate_cache, &compaction_cache, &confstate_cache, &malformed);
             try sealed.append(allocator, .{ .seg_no = sn, .group_max = gm });
             if (sn > max_seg_no) max_seg_no = sn;
         }
@@ -322,7 +331,7 @@ pub const SharedWal = struct {
         // The active segment is the only one that can have a torn tail.
         const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = false, .read = true });
         errdefer file.close();
-        const valid_end = try scanForReplay(allocator, file, &recovered, &active_group_max, &hardstate_cache, &compaction_cache, &confstate_cache);
+        const valid_end = try scanForReplay(allocator, file, &recovered, &active_group_max, &hardstate_cache, &compaction_cache, &confstate_cache, &malformed);
         try file.setEndPos(valid_end);
         try file.seekTo(valid_end);
 
@@ -345,6 +354,7 @@ pub const SharedWal = struct {
             .confstate_cache = confstate_cache,
             .compaction = std.AutoHashMap(u64, u64).init(allocator),
             .recovered = recovered,
+            .malformed_records = malformed,
         };
         return self;
     }
@@ -651,6 +661,13 @@ fn scanForReplay(
     hardstate_cache: *std.AutoHashMap(u64, [HS_PAYLOAD_LEN]u8),
     compaction_cache: *std.AutoHashMap(u64, [COMPACTION_PAYLOAD_LEN]u8),
     confstate_cache: *std.AutoHashMap(u64, []u8),
+    /// Incremented per CRC-valid record whose fixed-size payload is the wrong
+    /// length. Reported rather than logged at error level here: the count is a
+    /// FACT recovery should carry to its caller (`SharedWal.malformed_records`),
+    /// and an `std.log.err` inside the scan would fail every recovery test that
+    /// exercises this path — Zig's test runner treats a logged error as a
+    /// failure, so the paths most worth a regression test would have none.
+    malformed: *usize,
 ) !u64 {
     var off: u64 = 0;
     var header: [HEADER_LEN]u8 = undefined;
@@ -691,15 +708,38 @@ fn scanForReplay(
                 const gop = try group_max.getOrPut(group_id);
                 if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
             },
+            // A CRC-VALID record whose fixed-size payload is the wrong
+            // length. The append path rejects these outright now
+            // (`appendRecord`), so one on disk was written by an older
+            // build or is corruption that happened to pass CRC — either
+            // way it is never "nothing to see".
+            //
+            // LOUD BUT SOFT HERE, deliberately. This scan covers the whole
+            // WAL, so returning an error would refuse recovery for EVERY
+            // group over one bad record — a worse outcome than the record
+            // itself. The per-group refusal lives in `initRecover`, whose
+            // blast radius is the one group that cannot be trusted.
             .hardstate => if (payload_len == HS_PAYLOAD_LEN) {
                 var hs: [HS_PAYLOAD_LEN]u8 = undefined;
                 @memcpy(&hs, payload[0..HS_PAYLOAD_LEN]);
                 try hardstate_cache.put(group_id, hs);
+            } else {
+                malformed.* += 1;
+                std.log.warn(
+                    "raft wal: group {d} hardstate record has payload_len {d} (want {d}) at offset {d} — NOT cached; this group's hardstate may not survive segment GC",
+                    .{ group_id, payload_len, HS_PAYLOAD_LEN, off },
+                );
             },
             .compaction => if (payload_len == COMPACTION_PAYLOAD_LEN) {
                 var cp: [COMPACTION_PAYLOAD_LEN]u8 = undefined;
                 @memcpy(&cp, payload[0..COMPACTION_PAYLOAD_LEN]);
                 try compaction_cache.put(group_id, cp);
+            } else {
+                malformed.* += 1;
+                std.log.warn(
+                    "raft wal: group {d} compaction record has payload_len {d} (want {d}) at offset {d} — NOT cached; initRecover will refuse this group",
+                    .{ group_id, payload_len, COMPACTION_PAYLOAD_LEN, off },
+                );
             },
             .confstate => try SharedWal.putConfstate(confstate_cache, allocator, group_id, payload),
         }
@@ -829,15 +869,24 @@ pub const GroupedFileStorage = struct {
             // their state lives in the application snapshot, and the
             // segment that held them may have been GC'd, so replaying
             // them would gap. Anchor the sentinel there and skip them.
+            //
+            // A compaction record we cannot read is REFUSED, not skipped.
+            // Skipping leaves snap_index at 0, which does not mean "no
+            // snapshot" — it means "replay from the beginning", including
+            // entries compaction already dropped and whose segment may
+            // have been GC'd. The group would come up with a gapped log
+            // rather than an honest failure. Refusing costs this ONE
+            // group's recovery; the caller logs and skips it, and the
+            // membership reconciler re-attaches from a peer.
             var snap_index: u64 = 0;
             var snap_term: u64 = 0;
             for (bucket.items) |r| {
-                if (r.tag == .compaction and r.payload.len == COMPACTION_PAYLOAD_LEN) {
-                    const idx = std.mem.readInt(u64, r.payload[0..8], .little);
-                    if (idx >= snap_index) {
-                        snap_index = idx;
-                        snap_term = std.mem.readInt(u64, r.payload[8..16], .little);
-                    }
+                if (r.tag != .compaction) continue;
+                if (r.payload.len != COMPACTION_PAYLOAD_LEN) return error.MalformedRecord;
+                const idx = std.mem.readInt(u64, r.payload[0..8], .little);
+                if (idx >= snap_index) {
+                    snap_index = idx;
+                    snap_term = std.mem.readInt(u64, r.payload[8..16], .little);
                 }
             }
             if (snap_index > 0) {
@@ -1275,6 +1324,89 @@ pub const vtable: c.RaftStorageVTable = .{
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// Append a hand-framed record to a WAL file: header + payload + a VALID
+/// CRC trailer. The append path refuses to write a wrong-length fixed-size
+/// record now, so producing one for a test means writing the bytes directly —
+/// which is also exactly how such a record reaches disk in the field (an
+/// older build, or corruption that happens to checksum).
+fn appendRawRecord(path: []const u8, tag_byte: u8, group_id: u64, payload: []const u8) !void {
+    var f = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer f.close();
+    var header: [HEADER_LEN]u8 = undefined;
+    header[0] = tag_byte;
+    std.mem.writeInt(u64, header[1..9], group_id, .little);
+    std.mem.writeInt(u32, header[9..13], @intCast(payload.len), .little);
+    var crc = std.hash.Crc32.init();
+    crc.update(header[0..]);
+    crc.update(payload);
+    var trailer: [TRAILER_LEN]u8 = undefined;
+    std.mem.writeInt(u32, trailer[0..], crc.final(), .little);
+    try f.seekTo(try f.getEndPos());
+    try f.writeAll(header[0..]);
+    try f.writeAll(payload);
+    try f.writeAll(trailer[0..]);
+}
+
+test "recovery: a CRC-valid compaction record of the wrong length is REFUSED, not skipped" {
+    // The snapshot point comes from the highest compaction marker. Skipping an
+    // unreadable one leaves snap_index at 0, and 0 does NOT mean "no snapshot"
+    // — it means "replay from the beginning", including entries compaction
+    // already dropped and whose segment may have been GC'd. The group would
+    // come up with a gapped log instead of failing honestly.
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g.deinit();
+        var b = [_]c.RaftEntryFfi{fakeEntry(1, 1, "a")};
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, 1));
+        try wal.flush();
+    }
+
+    // 12 bytes where 16 are required, framed correctly, CRC valid.
+    try appendRawRecord(h.path, 4, 1, &[_]u8{0} ** 12);
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    // The scan REPORTS it (whole-file, so it must not refuse for every group)…
+    try testing.expectEqual(@as(usize, 1), wal.malformed_records);
+    // …and the per-group recovery REFUSES, which is the blast radius that can
+    // afford to be loud: one group fails, the node still boots.
+    try testing.expectError(
+        error.MalformedRecord,
+        GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1),
+    );
+}
+
+test "recovery: a well-formed compaction record still anchors the snapshot point" {
+    // The other half: refusal must key on the LENGTH being wrong, not on the
+    // record being a compaction marker at all. Without this, the check above
+    // could pass while quietly breaking every compacted group's recovery.
+    var h = try Harness.init();
+    defer h.deinit();
+
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g.deinit();
+        var b = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "b"), fakeEntry(1, 3, "c") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, b.len));
+        try g.compact(2);
+        try wal.flush();
+    }
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    try testing.expectEqual(@as(usize, 0), wal.malformed_records);
+    const g = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g.deinit();
+    try testing.expectEqual(@as(u64, 2), g.compaction_index);
+}
 
 const Harness = struct {
     tmp: std.testing.TmpDir,

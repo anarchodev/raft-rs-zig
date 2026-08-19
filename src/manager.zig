@@ -580,6 +580,16 @@ pub const Manager = struct {
     /// readiness again: a persist ack commonly unlocks a commit
     /// advance with committed entries to apply (the group re-enters
     /// the ready channel). Unknown group / nothing pending = no-op.
+    ///
+    /// NOTE for anyone tempted to add a "was the WAL flushed?" assertion here
+    /// (rove#102 proposed exactly that): a dirty-since-last-flush bit is the
+    /// WRONG shape under an async, coalescing flusher. Appends made after the
+    /// covering fsync was REQUESTED leave the WAL dirty while the entries
+    /// being acked here are already durable, so such an assertion fires on
+    /// every correct ack. Coverage is per-group and sequence-numbered
+    /// (rove's `persist_seq <= completed`), and that comparison is what the
+    /// caller already evaluates to decide to call this — so an assertion at
+    /// this boundary can only restate it, never check it.
     pub fn onPersist(self: *Manager, group_id: u64) void {
         _ = c.raft_manager_on_persist(self.ptr, group_id);
     }
