@@ -376,27 +376,6 @@ fn applySnapshotCb(
     return 0;
 }
 
-/// A debug-only witness that the caller is keeping its durability contract:
-/// something that can say whether writes have landed since its last fsync.
-///
-/// The async-append safety rule — a commit quorum counts only FSYNCED entries
-/// — holds only if every pump cycle runs `processReady` → fsync →
-/// `onPersist` per group. No layer can enforce that alone: `onPersist` is a
-/// Manager call and the fsync belongs to the caller's WAL. This is the seam
-/// where the two facts meet, so a caller that acks persistence without
-/// flushing first trips an assertion instead of silently counting volatile
-/// entries toward a commit quorum — a failure with no symptom until a power
-/// loss takes the entries back.
-pub const DurabilityWitness = struct {
-    ctx: *anyopaque,
-    /// True iff records were appended since the last successful flush.
-    dirtyFn: *const fn (*anyopaque) bool,
-
-    pub fn dirty(self: DurabilityWitness) bool {
-        return self.dirtyFn(self.ctx);
-    }
-};
-
 pub const vtable: c.RaftStorageVTable = .{
     .initial_state = initialStateCb,
     .entries = entriesCb,

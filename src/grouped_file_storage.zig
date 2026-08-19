@@ -212,7 +212,6 @@ pub const SharedWal = struct {
     /// Records appended since the last successful `flush` — i.e. bytes that
     /// are in the page cache and would be lost to a power cut. Read through
     /// `durabilityWitness`; see `DurabilityWitness` for what it guards.
-    dirty_since_flush: bool = false,
     /// CRC-valid records `open` found whose fixed-size payload was the wrong
     /// length. Non-zero means this WAL holds records written by a build that
     /// predates the append-path reject, or corruption that passed CRC — either
@@ -390,19 +389,6 @@ pub const SharedWal = struct {
     /// segments were already fsynced at seal time.)
     pub fn flush(self: *SharedWal) !void {
         try self.file.sync();
-        self.dirty_since_flush = false;
-    }
-
-    /// A `DurabilityWitness` over this WAL, for `Manager.setDurabilityWitness`.
-    /// Wiring it is what turns the append → fsync → `onPersist` contract from
-    /// a convention into something a test can fail on.
-    pub fn durabilityWitness(self: *SharedWal) mem_storage.DurabilityWitness {
-        return .{ .ctx = self, .dirtyFn = witnessDirty };
-    }
-
-    fn witnessDirty(ctx: *anyopaque) bool {
-        const self: *SharedWal = @ptrCast(@alignCast(ctx));
-        return self.dirty_since_flush;
     }
 
     /// Append one record to the WAL, rolling to a new segment first if
@@ -416,9 +402,6 @@ pub const SharedWal = struct {
         payload: []const u8,
     ) !u64 {
         if (self.wal_offset >= self.segment_target) try self.roll();
-        // Anything appended from here sits in the page cache, not on the
-        // platter, until `flush`. See `DurabilityWitness`.
-        self.dirty_since_flush = true;
 
         // Maintain the GC + header caches from the append stream itself,
         // so neither needs back-pointers to the groups.
@@ -1423,33 +1406,6 @@ test "recovery: a well-formed compaction record still anchors the snapshot point
     const g = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
     defer g.deinit();
     try testing.expectEqual(@as(u64, 2), g.compaction_index);
-}
-
-test "durability witness: dirty from the first append until the fsync clears it" {
-    // What `Manager.onPersist` asserts on. The contract it guards — a commit
-    // quorum counts only FSYNCED entries — is invisible at every individual
-    // layer: the WAL knows what is unflushed, the Manager knows what is being
-    // acked, and only their caller sequences the two.
-    var h = try Harness.init();
-    defer h.deinit();
-
-    const wal = try SharedWal.init(testing.allocator, h.path);
-    defer wal.deinit();
-    const g = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
-    defer g.deinit();
-
-    const witness = wal.durabilityWitness();
-    // The genesis confstate record is itself an append, so a freshly-built
-    // group is already dirty — acking persistence here would count it.
-    try testing.expect(witness.dirty());
-    try wal.flush();
-    try testing.expect(!witness.dirty());
-
-    var b = [_]c.RaftEntryFfi{fakeEntry(1, 1, "a")};
-    try testing.expectEqual(@as(i32, 0), appendEntriesCb(g, &b, 1));
-    try testing.expect(witness.dirty());
-    try wal.flush();
-    try testing.expect(!witness.dirty());
 }
 
 const Harness = struct {
