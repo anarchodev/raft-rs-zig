@@ -99,6 +99,35 @@ pub const Tag = enum(u8) {
     /// segment header (like hard state), and consumed by recovery to
     /// anchor the log sentinel above 1 so a GC'd prefix is not a gap.
     compaction = 4,
+    /// An entry whose `data` field is SEALED by the WAL's `PayloadCodec`.
+    /// Same layout as `entry` — only the bytes of `data` differ — so the
+    /// index, term and type stay readable framing, and scanning, GC and
+    /// recovery never need a key. Distinct from `entry` so sealedness is
+    /// exact rather than guessed from the bytes: a plaintext entry written
+    /// before a codec existed, or for a group the codec leaves plaintext,
+    /// still reads as one.
+    sealed_entry = 5,
+};
+
+/// Seals and opens entry `data` for the groups that want it — the WAL's
+/// only knowledge of cryptography, and it is none: what a key is, where it
+/// lives and which groups have one are the codec owner's business.
+///
+/// Only an entry's `data` goes through it. Framing, hard state, confstate
+/// and compaction markers stay plaintext, so recovery rebuilds offsets and
+/// membership, and a node never forgets its term or vote, whether or not a
+/// key is to hand.
+pub const PayloadCodec = struct {
+    ctx: *anyopaque,
+    /// Seal `data` for `group_id`, allocated with `allocator`. Null means
+    /// this group's entries are written plaintext. An ERROR means the group
+    /// wants sealing and cannot have it now — the append fails rather than
+    /// fall back to plaintext.
+    seal: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, group_id: u64, data: []const u8) anyerror!?[]u8,
+    /// Open sealed `data` for `group_id`, allocated with `allocator`. An
+    /// error means this node cannot open it (yet); recovery then leaves the
+    /// group's records with the WAL for a later attempt.
+    open: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, group_id: u64, sealed: []const u8) anyerror![]u8,
 };
 
 /// Length of the per-record header: tag + group_id + payload_len.
@@ -209,6 +238,10 @@ pub const SharedWal = struct {
     /// bucket in `GroupedFileStorage.initRecover`; `deinit` frees any
     /// bucket that was never drained.
     recovered: std.AutoHashMap(u64, std.ArrayList(RecoveredRecord)),
+    /// Seals entry data for the groups that want it; null writes every
+    /// entry plaintext. Set by the owner before any group is created or
+    /// recovered (`setCodec`) — recovery needs it to open sealed entries.
+    codec: ?PayloadCodec = null,
     /// Records appended since the last successful `flush` — i.e. bytes that
     /// are in the page cache and would be lost to a power cut. Read through
     /// `durabilityWitness`; see `DurabilityWitness` for what it guards.
@@ -378,6 +411,20 @@ pub const SharedWal = struct {
     /// caller, which must free each `payload` and `deinit` the list).
     /// Removes the bucket so `deinit` won't double-free it. Null when
     /// the group has nothing to replay.
+    /// Install the payload codec. Before any group is created or
+    /// recovered: a group written plaintext under no codec reads back fine
+    /// once one is set, but a sealed record is unreadable without it.
+    pub fn setCodec(self: *SharedWal, codec: PayloadCodec) void {
+        self.codec = codec;
+    }
+
+    /// Hand a group's recovered records back, untouched, for a later
+    /// `initRecover` — what a recovery that could not open a sealed entry
+    /// does, so the durable records are not lost with the attempt.
+    fn putBackRecovered(self: *SharedWal, group_id: u64, bucket: std.ArrayList(RecoveredRecord)) !void {
+        try self.recovered.put(group_id, bucket);
+    }
+
     pub fn takeRecovered(self: *SharedWal, group_id: u64) ?std.ArrayList(RecoveredRecord) {
         if (self.recovered.fetchRemove(group_id)) |kv| return kv.value;
         return null;
@@ -423,7 +470,7 @@ pub const SharedWal = struct {
             // in production; tests use .entry as a generic small-record framing
             // vehicle, so SKIP-the-cache (not reject) here, unlike the exact-size
             // hardstate/compaction records above which are hard invariants.
-            .entry => if (payload.len >= 20) {
+            .entry, .sealed_entry => if (payload.len >= 20) {
                 const idx = std.mem.readInt(u64, payload[12..20], .little);
                 const gop = try self.active_group_max.getOrPut(group_id);
                 if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
@@ -681,6 +728,7 @@ fn scanForReplay(
             2 => .hardstate,
             3 => .confstate,
             4 => .compaction,
+            5 => .sealed_entry,
             else => break, // unknown tag — garbage from a torn write
         };
         const group_id = std.mem.readInt(u64, header[1..9], .little);
@@ -703,7 +751,7 @@ fn scanForReplay(
 
         // Rebuild GC / header state from the record.
         switch (tag) {
-            .entry => if (payload_len >= 20) {
+            .entry, .sealed_entry => if (payload_len >= 20) {
                 const idx = std.mem.readInt(u64, payload[12..20], .little);
                 const gop = try group_max.getOrPut(group_id);
                 if (!gop.found_existing or idx > gop.value_ptr.*) gop.value_ptr.* = idx;
@@ -859,10 +907,19 @@ pub const GroupedFileStorage = struct {
 
         if (wal.takeRecovered(group_id)) |taken| {
             var bucket = taken;
-            defer {
+            // Set when a sealed entry could not be opened: the records go
+            // back to the WAL untouched, for a later attempt, instead of
+            // being freed with this one.
+            var give_back = false;
+            defer if (give_back) {
+                wal.putBackRecovered(group_id, bucket) catch {
+                    for (bucket.items) |r| allocator.free(r.payload);
+                    bucket.deinit(allocator);
+                };
+            } else {
                 for (bucket.items) |r| allocator.free(r.payload);
                 bucket.deinit(allocator);
-            }
+            };
 
             // Pre-pass: the highest compaction marker is the snapshot
             // point. Entries at or below it were dropped by compaction —
@@ -896,10 +953,44 @@ pub const GroupedFileStorage = struct {
                 try self.entry_offsets.append(self.allocator, 0); // sentinel slot
             }
 
-            for (bucket.items) |r| switch (r.tag) {
+            // Open every sealed entry the replay will need BEFORE replaying
+            // any: a key that is missing must leave the group untouched and
+            // its records with the WAL, not half-rebuilt.
+            const opened = try allocator.alloc(?[]u8, bucket.items.len);
+            @memset(opened, null);
+            defer {
+                for (opened) |o| if (o) |b| {
+                    std.crypto.secureZero(u8, b);
+                    allocator.free(b);
+                };
+                allocator.free(opened);
+            }
+            for (bucket.items, 0..) |r, i| {
+                if (r.tag != .sealed_entry) continue;
+                const e = try parseEntryPayload(r.payload);
+                if (e.index <= snap_index) continue; // covered by the snapshot
+                const codec = wal.codec orelse {
+                    give_back = true;
+                    return error.NoPayloadCodec;
+                };
+                opened[i] = codec.open(codec.ctx, allocator, group_id, e.data[0..e.data_len]) catch |err| {
+                    give_back = true;
+                    return err;
+                };
+            }
+
+            for (bucket.items, 0..) |r, i| switch (r.tag) {
                 .entry => {
                     const e = try parseEntryPayload(r.payload);
                     if (e.index <= snap_index) continue; // covered by the snapshot
+                    try self.replayEntry(e, r.offset);
+                },
+                .sealed_entry => {
+                    var e = try parseEntryPayload(r.payload);
+                    if (e.index <= snap_index) continue;
+                    const plain = opened[i].?;
+                    e.data = plain.ptr;
+                    e.data_len = plain.len;
                     try self.replayEntry(e, r.offset);
                 },
                 .hardstate => self.replayHardState(try parseHardStatePayload(r.payload)),
@@ -1114,17 +1205,31 @@ pub const GroupedFileStorage = struct {
     }
 
     fn writeEntryRecord(self: *GroupedFileStorage, e: c.RaftEntryFfi) !u64 {
+        const data: []const u8 = if (e.data_len > 0) e.data[0..e.data_len] else &.{};
+        // Only a normal entry carrying bytes is the codec's business: an
+        // empty one (leadership no-op) carries nothing, and a conf change
+        // is membership, which the WAL also keeps as plaintext confstate.
+        const sealed: ?[]u8 = if (self.wal.codec) |codec|
+            (if (e.entry_type == 0 and data.len > 0)
+                try codec.seal(codec.ctx, self.allocator, self.group_id, data)
+            else
+                null)
+        else
+            null;
+        defer if (sealed) |b| self.allocator.free(b);
+        const body: []const u8 = sealed orelse data;
+
         self.scratch.clearRetainingCapacity();
         const w = self.scratch.writer(self.allocator);
         try w.writeInt(u32, e.entry_type, .little);
         try w.writeInt(u64, e.term, .little);
         try w.writeInt(u64, e.index, .little);
-        try w.writeInt(u32, @intCast(e.data_len), .little);
-        if (e.data_len > 0) try w.writeAll(e.data[0..e.data_len]);
+        try w.writeInt(u32, @intCast(body.len), .little);
+        if (body.len > 0) try w.writeAll(body);
         try w.writeInt(u32, @intCast(e.context_len), .little);
         if (e.context_len > 0) try w.writeAll(e.context[0..e.context_len]);
         try w.writeByte(if (e.sync_log) 1 else 0);
-        return self.wal.appendRecord(self.group_id, .entry, self.scratch.items);
+        return self.wal.appendRecord(self.group_id, if (sealed != null) .sealed_entry else .entry, self.scratch.items);
     }
 
     fn writeHardStateRecord(self: *GroupedFileStorage, hs: c.RaftHardStateFfi) !void {
@@ -2051,4 +2156,144 @@ test "segment GC: noteGroupDestroyed reclaims a detached group's sealed segments
     wal.noteGroupDestroyed(1);
     try testing.expectEqual(@as(usize, 0), wal.sealed.items.len);
     try testing.expectError(error.FileNotFound, std.fs.cwd().access(p, .{}));
+}
+
+// ── sealed entries (PayloadCodec) ────────────────────────────────────────
+
+/// Seals group 1 (a byte flip behind a marker — a stand-in, since the WAL
+/// knows nothing about what sealing is), leaves group 2 plaintext, and can
+/// be told its key is unavailable.
+const TestCodec = struct {
+    unavailable: bool = false,
+
+    fn seal(ctx: *anyopaque, a: std.mem.Allocator, group_id: u64, data: []const u8) anyerror!?[]u8 {
+        const self: *TestCodec = @ptrCast(@alignCast(ctx));
+        if (group_id != 1) return null;
+        if (self.unavailable) return error.KeyUnavailable;
+        const out = try a.alloc(u8, data.len + 2);
+        out[0] = 'S';
+        out[1] = '!';
+        for (data, 0..) |b, i| out[i + 2] = b ^ 0x5A;
+        return out;
+    }
+    fn open(ctx: *anyopaque, a: std.mem.Allocator, group_id: u64, sealed: []const u8) anyerror![]u8 {
+        const self: *TestCodec = @ptrCast(@alignCast(ctx));
+        _ = group_id;
+        if (self.unavailable) return error.KeyUnavailable;
+        if (sealed.len < 2 or sealed[0] != 'S') return error.Corrupt;
+        const out = try a.alloc(u8, sealed.len - 2);
+        for (sealed[2..], 0..) |b, i| out[i] = b ^ 0x5A;
+        return out;
+    }
+    fn codec(self: *TestCodec) PayloadCodec {
+        return .{ .ctx = self, .seal = seal, .open = open };
+    }
+};
+
+fn fileContains(path: []const u8, needle: []const u8) !bool {
+    const bytes = try std.fs.cwd().readFileAlloc(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, needle) != null;
+}
+
+test "sealed entries: a sealing group's data never reaches the file in plaintext; a plaintext group's does" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var tc: TestCodec = .{};
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        wal.setCodec(tc.codec());
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+        const g2 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 2);
+        defer g2.deinit();
+        var b1 = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "customer-secret-1"), fakeEntry(1, 2, "") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b1, b1.len));
+        var b2 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "directory-row")};
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g2, &b2, 1));
+        // The in-memory view raft reads stays plaintext.
+        try testing.expectEqualStrings("customer-secret-1", g1.mem.entries.items[1].data);
+        try wal.flush();
+    }
+    try testing.expect(!try fileContains(h.path, "customer-secret-1"));
+    try testing.expect(try fileContains(h.path, "directory-row"));
+
+    // Recovery opens it again.
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    wal.setCodec(tc.codec());
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    const g2 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 2);
+    defer g2.deinit();
+    try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+    try testing.expectEqualStrings("customer-secret-1", g1.mem.entries.items[1].data);
+    try testing.expectEqualStrings("", g1.mem.entries.items[2].data);
+    try testing.expectEqualStrings("directory-row", g2.mem.entries.items[1].data);
+}
+
+test "sealed entries: a key missing at recovery leaves the records with the WAL for a later attempt" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var tc: TestCodec = .{};
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        wal.setCodec(tc.codec());
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+        var b1 = [_]c.RaftEntryFfi{ fakeEntry(1, 1, "a"), fakeEntry(1, 2, "bb") };
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b1, b1.len));
+        try wal.flush();
+    }
+
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    tc.unavailable = true;
+    wal.setCodec(tc.codec());
+    try testing.expectError(error.KeyUnavailable, GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1));
+    // Nothing was lost with the attempt: once the key is to hand, the same
+    // WAL recovers the group whole.
+    tc.unavailable = false;
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    try testing.expectEqual(@as(u64, 2), g1.mem.lastIndex());
+    try testing.expectEqualStrings("bb", g1.mem.entries.items[2].data);
+}
+
+test "sealed entries: a group that wants sealing and cannot have it refuses the append — never plaintext" {
+    var h = try Harness.init();
+    defer h.deinit();
+    var tc: TestCodec = .{ .unavailable = true };
+    const wal = try SharedWal.init(testing.allocator, h.path);
+    defer wal.deinit();
+    wal.setCodec(tc.codec());
+    const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    var b1 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "must-not-leak")};
+    try testing.expectEqual(@as(i32, -1), appendEntriesCb(g1, &b1, 1));
+    try wal.flush();
+    try testing.expect(!try fileContains(h.path, "must-not-leak"));
+}
+
+test "sealed entries: a WAL written before any codec still recovers once one is set" {
+    var h = try Harness.init();
+    defer h.deinit();
+    {
+        const wal = try SharedWal.init(testing.allocator, h.path);
+        defer wal.deinit();
+        const g1 = try GroupedFileStorage.init(testing.allocator, &.{1}, wal, 1);
+        defer g1.deinit();
+        var b1 = [_]c.RaftEntryFfi{fakeEntry(1, 1, "legacy")};
+        try testing.expectEqual(@as(i32, 0), appendEntriesCb(g1, &b1, 1));
+        try wal.flush();
+    }
+    var tc: TestCodec = .{};
+    const wal = try SharedWal.open(testing.allocator, h.path);
+    defer wal.deinit();
+    wal.setCodec(tc.codec());
+    const g1 = try GroupedFileStorage.initRecover(testing.allocator, &.{1}, wal, 1);
+    defer g1.deinit();
+    try testing.expectEqualStrings("legacy", g1.mem.entries.items[1].data);
 }
